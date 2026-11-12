@@ -7,6 +7,7 @@
 #include <process.h>
 #include <string>
 #include <stdio.h>
+#include <float.h>
 #include "pipeline.h"
 
 #pragma comment(lib, "comdlg32.lib")
@@ -33,6 +34,8 @@ static HFONT bodyFont, titleFont, smallFont, boldFont;
 static HBRUSH bgBrush, whiteBrush;
 static bool busy = false;
 static int progress = -1;
+static HANDLE cancelEvent = NULL;
+static HANDLE workerThread = NULL;
 
 static std::wstring getText(HWND h) {
     int n = GetWindowTextLengthW(h);
@@ -105,8 +108,8 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
         add(L"STATIC", L"预览图将自动嵌入 Excel，材料牌号支持下拉切换并实时动态重算。", 0, 280, 301, 440, 22, ID_INFO, smallFont);
 
-        runButton = add(L"BUTTON", L"生成 Excel BOM", BS_OWNERDRAW | BS_DEFPUSHBUTTON, 34, 360, 168, 42, ID_RUN, boldFont);
-        statusText = add(L"STATIC", L"就绪。请选择 CATPart 模型文件，点击“生成 Excel BOM”开始执行。", 0, 36, 468, 680, 26, ID_STATUS, smallFont);
+        runButton = add(L"BUTTON", L"开始生成实体 BOM", BS_OWNERDRAW | BS_DEFPUSHBUTTON, 34, 360, 168, 42, ID_RUN, boldFont);
+        statusText = add(L"STATIC", L"就绪。请选择 CATPart 模型文件，点击“开始生成实体 BOM”开始执行。", 0, 36, 468, 680, 26, ID_STATUS, smallFont);
 
         return 0;
     }
@@ -161,7 +164,7 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         bool disabled = (d->itemState & ODS_DISABLED) != 0;
 
         COLORREF fill = disabled ? RGB(187, 198, 208) :
-                        primary ? RGB(35, 103, 156) : RGB(255, 255, 255);
+                        primary ? (busy ? RGB(180, 60, 60) : RGB(35, 103, 156)) : RGB(255, 255, 255);
         COLORREF edge = primary ? fill : RGB(192, 204, 214);
 
         HBRUSH b = CreateSolidBrush(fill);
@@ -227,7 +230,18 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
 
         case ID_RUN: {
-            if (busy) return 0;
+            if (busy) {
+                // User requested cancellation
+                if (cancelEvent) {
+                    SetEvent(cancelEvent);
+                }
+                EnableWindow(runButton, FALSE);
+                SetWindowTextW(runButton, L"正在取消...");
+                status(L"正在中止后台分析任务并清理资源，请稍候…");
+                InvalidateRect(h, NULL, FALSE);
+                return 0;
+            }
+
             std::wstring in = getText(editInput);
             std::wstring out = getText(editOutput);
 
@@ -256,6 +270,8 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return 0;
             }
 
+            cancelEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+
             BomJob* job = new BomJob;
             job->input = in;
             job->outputDir = out;
@@ -263,22 +279,33 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
             int n = (int)SendMessageW(combo, CB_GETCURSEL, 0, 0);
             job->size = (n == 0) ? 600 : ((n == 2) ? 1200 : 800);
             job->notify = h;
+            job->cancelEvent = cancelEvent;
 
             busy = true;
             progress = 0;
-            EnableWindow(runButton, FALSE);
+            SetWindowTextW(runButton, L"取消生成");
+            EnableWindow(runButton, TRUE);
             EnableWindow(combo, FALSE);
+            EnableWindow(editInput, FALSE);
+            EnableWindow(editOutput, FALSE);
             status(L"正在启动后台分析服务并读取 CATPart 模型…");
             InvalidateRect(h, NULL, FALSE);
 
             uintptr_t th = _beginthreadex(NULL, 0, RunBomJob, job, 0, NULL);
             if (th) {
-                CloseHandle((HANDLE)th);
+                workerThread = (HANDLE)th;
             } else {
                 delete job;
+                if (cancelEvent) {
+                    CloseHandle(cancelEvent);
+                    cancelEvent = NULL;
+                }
                 busy = false;
+                SetWindowTextW(runButton, L"开始生成实体 BOM");
                 EnableWindow(runButton, TRUE);
                 EnableWindow(combo, TRUE);
+                EnableWindow(editInput, TRUE);
+                EnableWindow(editOutput, TRUE);
                 status(L"无法启动任务处理线程。");
             }
             return 0;
@@ -299,18 +326,39 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else if (w == 2) {
             progress = 85;
             status(L"实体分析完成，正在生成 Excel 工作簿与嵌入预览图…");
-        } else if (w == 3 || w == 4) {
+        } else if (w == 3 || w == 4 || w == 5) {
             std::wstring* result = (std::wstring*)l;
+
+            if (workerThread) {
+                WaitForSingleObject(workerThread, 1000);
+                CloseHandle(workerThread);
+                workerThread = NULL;
+            }
+            if (cancelEvent) {
+                CloseHandle(cancelEvent);
+                cancelEvent = NULL;
+            }
+
             busy = false;
+            SetWindowTextW(runButton, L"开始生成实体 BOM");
             EnableWindow(runButton, TRUE);
             EnableWindow(combo, TRUE);
-            progress = (w == 3) ? 100 : 0;
-            status((w == 3) ? L"Excel BOM 已生成完成。" : L"导出已中止或生成失败，请查看提示信息。");
+            EnableWindow(editInput, TRUE);
+            EnableWindow(editOutput, TRUE);
 
-            MessageBoxW(h, result ? result->c_str() : L"任务结束。",
-                        (w == 3) ? L"生成完成" : L"提示",
-                        MB_OK | ((w == 3) ? MB_ICONINFORMATION : MB_ICONWARNING));
-            delete result;
+            if (w == 5) {
+                progress = 0;
+                status(L"任务已取消。");
+                delete result;
+            } else {
+                progress = (w == 3) ? 100 : 0;
+                status((w == 3) ? L"Excel BOM 已生成完成。" : L"导出已中止或生成失败，请查看提示信息。");
+
+                MessageBoxW(h, result ? result->c_str() : L"任务结束。",
+                            (w == 3) ? L"生成完成" : L"提示",
+                            MB_OK | ((w == 3) ? MB_ICONINFORMATION : MB_ICONWARNING));
+                delete result;
+            }
         }
         InvalidateRect(h, NULL, FALSE);
         return 0;
@@ -318,7 +366,23 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_CLOSE: {
         if (busy) {
-            MessageBoxW(h, L"BOM 正在生成中，请等待任务完成。", L"请稍候", MB_OK | MB_ICONINFORMATION);
+            if (MessageBoxW(h, L"BOM 正在生成中，是否中止当前任务并退出程序？", L"确认退出", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+                return 0;
+            }
+            if (cancelEvent) {
+                SetEvent(cancelEvent);
+            }
+            if (workerThread) {
+                WaitForSingleObject(workerThread, 3000);
+                CloseHandle(workerThread);
+                workerThread = NULL;
+            }
+            if (cancelEvent) {
+                CloseHandle(cancelEvent);
+                cancelEvent = NULL;
+            }
+            busy = false;
+            DestroyWindow(h);
             return 0;
         }
         DestroyWindow(h);
@@ -340,8 +404,113 @@ static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+static LRESULT CALLBACK CliProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    if (msg == WM_PROGRESS) {
+        if (w == 3 || w == 4 || w == 5) {
+            std::wstring* p = (std::wstring*)l;
+            delete p;
+            PostQuitMessage(0);
+        }
+        return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int show) {
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 2 && (_wcsicmp(argv[1], L"/c") == 0 || _wcsicmp(argv[1], L"-c") == 0)) {
+        if (argc < 4 || argc > 6) {
+            LocalFree(argv);
+            CoUninitialize();
+            return 2;
+        }
+        int sz = 800;
+        if (argc >= 5) {
+            sz = _wtoi(argv[4]);
+            if (sz != 600 && sz != 800 && sz != 1200) {
+                LocalFree(argv);
+                CoUninitialize();
+                return 2;
+            }
+        }
+        double density = 0.0;
+        if (argc == 6) {
+            wchar_t* end = NULL;
+            density = wcstod(argv[5], &end);
+            if (end == argv[5] || *end != 0 || !_finite(density) || density <= 0.0) {
+                LocalFree(argv);
+                CoUninitialize();
+                return 2;
+            }
+        }
+        std::wstring inPath = argv[2];
+        std::wstring outDir = argv[3];
+
+        DWORD a = GetFileAttributesW(inPath.c_str());
+        if (inPath.empty() || a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY)) {
+            LocalFree(argv);
+            CoUninitialize();
+            return 1;
+        }
+
+        DWORD b = GetFileAttributesW(outDir.c_str());
+        if (b == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryW(outDir.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+                LocalFree(argv);
+                CoUninitialize();
+                return 1;
+            }
+            b = GetFileAttributesW(outDir.c_str());
+        }
+        if (b == INVALID_FILE_ATTRIBUTES || !(b & FILE_ATTRIBUTE_DIRECTORY)) {
+            LocalFree(argv);
+            CoUninitialize();
+            return 1;
+        }
+
+        WNDCLASSW wcCli = {};
+        wcCli.lpfnWndProc = CliProc;
+        wcCli.hInstance = inst;
+        wcCli.lpszClassName = L"CAABomCliHiddenWindow";
+        RegisterClassW(&wcCli);
+
+        HWND hCli = CreateWindowW(wcCli.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, inst, NULL);
+        int cliExitCode = 1;
+        BomJob* job = new BomJob;
+        job->input = inPath;
+        job->outputDir = outDir;
+        job->size = sz;
+        job->density = density;
+        job->notify = hCli;
+        job->outExitCode = &cliExitCode;
+
+        uintptr_t th = _beginthreadex(NULL, 0, RunBomJob, job, 0, NULL);
+        if (!th) {
+            delete job;
+            LocalFree(argv);
+            CoUninitialize();
+            return 1;
+        }
+
+        MSG msg;
+        while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        WaitForSingleObject((HANDLE)th, INFINITE);
+        CloseHandle((HANDLE)th);
+
+        CoUninitialize();
+        LocalFree(argv);
+        return cliExitCode;
+    }
+    if (argv) {
+        LocalFree(argv);
+    }
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(WNDCLASSEXW);

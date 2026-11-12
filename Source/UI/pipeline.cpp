@@ -8,6 +8,7 @@
 #include <share.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <float.h>
 #include <algorithm>
 #include <vector>
 #include <string>
@@ -15,6 +16,10 @@
 namespace {
 
 const UINT MSG = WM_APP + 1;
+
+const DWORD WORKER_HEARTBEAT_TIMEOUT_MS = 180000;
+const DWORD WORKER_TOTAL_TIMEOUT_MS = 600000;
+const DWORD NODE_TIMEOUT_MS = 120000;
 
 static void send(HWND h, WPARAM stage, LPARAM value = 0) {
     if (h) PostMessageW(h, MSG, stage, value);
@@ -119,6 +124,26 @@ static std::string wideNarrow(const std::wstring& w) {
     WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, &s[0], n, NULL, NULL);
     s.resize(n - 1);
     return s;
+}
+
+static std::string safeNarrowPath(const std::wstring& w) {
+    if (w.empty()) return "";
+    bool asciiOnly = true;
+    for (size_t i = 0; i < w.size(); ++i) {
+        if (w[i] > 127) {
+            asciiOnly = false;
+            break;
+        }
+    }
+    if (asciiOnly) {
+        return wideNarrow(w);
+    }
+    wchar_t shortBuf[MAX_PATH + 1] = {0};
+    DWORD res = GetShortPathNameW(w.c_str(), shortBuf, MAX_PATH);
+    if (res > 0 && res <= MAX_PATH) {
+        return wideNarrow(shortBuf);
+    }
+    return wideNarrow(w);
 }
 
 static std::string wideUtf8(const std::wstring& w) {
@@ -265,11 +290,27 @@ static int phaseProgress(const std::string& s) {
             return 50 + 50 * a / b;
         }
     }
+    p = s.rfind("render_group_begin=");
+    if (p != std::string::npos) {
+        int a = 0, b = 0;
+        if (sscanf_s(s.c_str() + p, "render_group_begin=%d/%d", &a, &b) == 2 && b > 0) {
+            int base = 50 + 50 * (a > 0 ? a - 1 : 0) / b;
+            return std::min(99, base + 1);
+        }
+    }
     p = s.rfind("measure_done=");
     if (p != std::string::npos) {
         int a = 0, b = 0;
         if (sscanf_s(s.c_str() + p, "measure_done=%d/%d", &a, &b) == 2 && b > 0) {
             return 50 * a / b;
+        }
+    }
+    p = s.rfind("measure_begin=");
+    if (p != std::string::npos) {
+        int a = 0, b = 0;
+        if (sscanf_s(s.c_str() + p, "measure_begin=%d/%d", &a, &b) == 2 && b > 0) {
+            int base = 50 * (a > 0 ? a - 1 : 0) / b;
+            return std::min(49, base + 1);
         }
     }
     return 0;
@@ -308,19 +349,7 @@ static bool validateRows(const std::vector<std::vector<std::string> >& rows, int
     return true;
 }
 
-// Build the child environment block.
-//
-// IMPORTANT (cross-machine portability):  do NOT collect the entries into a
-// std::vector<std::wstring> and std::sort() them.  Windows keeps a few special
-// entries (e.g. the per-drive "=C:=C:\path" current-directory variables) that
-// begin with '='; a case-sensitive std::sort() would move them to the front and
-// re-order the rest differently from the parent block, which makes some CATIA /
-// CAA launchers refuse the block outright.  Windows itself stores the block in
-// case-insensitive sorted order and GetEnvironmentStringsW() already returns it
-// in the accepted order, so we copy it verbatim.
-//
-// The two CAA variables are injected through the real process environment so the
-// native copy picks them up (and the child inherits them too).
+// Build the child environment block and keep parent environment clean.
 static std::vector<wchar_t> environment(const std::wstring& input, const std::wstring& output) {
     SetEnvironmentVariableW(L"CAA_INPUT_PATH", input.c_str());
     SetEnvironmentVariableW(L"CAA_OUTPUT_DIR", output.c_str());
@@ -345,6 +374,11 @@ static std::vector<wchar_t> environment(const std::wstring& input, const std::ws
         block.push_back(0);
     }
     block.push_back(0);
+
+    // Immediately clean up parent environment variables to avoid pollution
+    SetEnvironmentVariableW(L"CAA_INPUT_PATH", NULL);
+    SetEnvironmentVariableW(L"CAA_OUTPUT_DIR", NULL);
+
     return block;
 }
 
@@ -356,16 +390,21 @@ static void writeLogHandle(HANDLE file, const std::string& text) {
     FlushFileBuffers(file);
 }
 
+static void terminateChildJob(HANDLE& hJob, PROCESS_INFORMATION& pi) {
+    if (hJob) {
+        TerminateJobObject(hJob, 1);
+        CloseHandle(hJob);
+        hJob = NULL;
+    }
+    if (pi.hProcess) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 3000);
+    }
+}
+
 // Launch a child process with stdio redirected into `logfile`.
-//
-//  - `workDir` (optional) becomes lpCurrentDirectory, so relative paths inside
-//    the child (node module resolution / template lookups) behave identically on
-//    every machine instead of inheriting the GUI's current directory.
-//  - A UTF-8 diagnostic header is written before CreateProcessW and a
-//    [launch_failed] line afterwards when the call fails, so worker_launcher.log
-//    and excel_builder.log are never 0 bytes even on a hard failure.
 static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::vector<wchar_t>* env,
-                   PROCESS_INFORMATION& pi, const wchar_t* workDir = NULL) {
+                   PROCESS_INFORMATION& pi, const wchar_t* workDir = NULL, HANDLE* outJob = NULL) {
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE file = CreateFileW(logfile.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -388,8 +427,19 @@ static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::ve
     mutableCmd.push_back(0);
     ZeroMemory(&pi, sizeof(pi));
 
-    // Diagnostic header (written before the child starts, so it always ends up at
-    // the beginning of the log and the file is never empty).
+    HANDLE hJob = NULL;
+    if (outJob != NULL) {
+        *outJob = NULL;
+        hJob = CreateJobObjectW(NULL, NULL);
+        if (hJob) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+            ZeroMemory(&jeli, sizeof(jeli));
+            jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+        }
+    }
+
+    // Diagnostic header (written before the child starts)
     {
         std::string head = "[launch] cmd=";
         head += wideUtf8(cmd);
@@ -404,11 +454,19 @@ static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::ve
         } else {
             head += "[launch] env=inherit\r\n";
         }
+        if (hJob != NULL) {
+            head += "[launch] job_object=enabled\r\n";
+        }
         writeLogHandle(file, head);
     }
 
+    DWORD creationFlags = CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0);
+    if (hJob != NULL) {
+        creationFlags |= CREATE_SUSPENDED;
+    }
+
     BOOL ok = CreateProcessW(NULL, &mutableCmd[0], NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                             creationFlags,
                              (env && !env->empty()) ? &(*env)[0] : NULL,
                              workDir, &si, &pi);
     if (!ok) {
@@ -416,6 +474,16 @@ static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::ve
         sprintf_s(buf, sizeof(buf), "[launch_failed] GetLastError=%lu\r\n",
                   (unsigned long)GetLastError());
         writeLogHandle(file, std::string(buf));
+        if (hJob) {
+            CloseHandle(hJob);
+            hJob = NULL;
+        }
+    } else {
+        if (hJob != NULL) {
+            AssignProcessToJobObject(hJob, pi.hProcess);
+            ResumeThread(pi.hThread);
+            *outJob = hJob;
+        }
     }
     CloseHandle(input);
     CloseHandle(file);
@@ -431,6 +499,35 @@ static void appendLog(const std::wstring& path, const std::wstring& line) {
     fclose(f);
 }
 
+static bool removeDirTree(const std::wstring& path) {
+    if (path.empty()) return false;
+    WIN32_FIND_DATAW d;
+    HANDLE h = FindFirstFileW((path + L"\\*").c_str(), &d);
+    if (h == INVALID_HANDLE_VALUE) {
+        return (RemoveDirectoryW(path.c_str()) != FALSE);
+    }
+    bool ok = true;
+    do {
+        if (!wcscmp(d.cFileName, L".") || !wcscmp(d.cFileName, L"..")) continue;
+        std::wstring item = path + L"\\" + d.cFileName;
+        if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!removeDirTree(item)) {
+                ok = false;
+            }
+        } else {
+            SetFileAttributesW(item.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!DeleteFileW(item.c_str())) {
+                ok = false;
+            }
+        }
+    } while (FindNextFileW(h, &d));
+    FindClose(h);
+    if (!RemoveDirectoryW(path.c_str())) {
+        ok = false;
+    }
+    return ok;
+}
+
 static bool cleanStage(const std::wstring& stage, const std::wstring& temp) {
     std::wstring a, b;
     if (!full(stage, a) || !full(temp, b)) return false;
@@ -438,11 +535,7 @@ static bool cleanStage(const std::wstring& stage, const std::wstring& temp) {
     if (a.size() <= b.size() || _wcsnicmp(a.c_str(), b.c_str(), b.size()) != 0 || !isDirectory(a)) {
         return false;
     }
-    // Windows 10 Defender / Search Indexer may still hold a handle on the freshly
-    // written files (node.exe, PNG previews, xlsx) for a few hundred ms after the
-    // child process exits, which makes the very first DeleteFileW() fail with
-    // ERROR_SHARING_VIOLATION.  Retry a few times instead of reporting a bogus
-    // cleanup failure.
+
     for (int attempt = 0; attempt < 5; attempt++) {
         WIN32_FIND_DATAW d;
         HANDLE h = FindFirstFileW((a + L"\\*").c_str(), &d);
@@ -455,14 +548,10 @@ static bool cleanStage(const std::wstring& stage, const std::wstring& temp) {
             if (!wcscmp(d.cFileName, L".") || !wcscmp(d.cFileName, L"..")) continue;
             std::wstring item = a + L"\\" + d.cFileName;
             if (d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (!RemoveDirectoryW(item.c_str())) ok = false;
+                if (!removeDirTree(item)) ok = false;
             } else {
-                if (!DeleteFileW(item.c_str())) {
-                    // Drop read-only / hidden attributes (Defender may set them)
-                    // and try once more.
-                    SetFileAttributesW(item.c_str(), FILE_ATTRIBUTE_NORMAL);
-                    if (!DeleteFileW(item.c_str())) ok = false;
-                }
+                SetFileAttributesW(item.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (!DeleteFileW(item.c_str())) ok = false;
             }
         } while (FindNextFileW(h, &d));
         FindClose(h);
@@ -485,9 +574,6 @@ static std::wstring findNodePath(const std::wstring& appRoot) {
         return envBuf;
     }
 
-    // NOTE: no machine-specific (C:\Users\<name>\...) fallbacks here.  The
-    // portable build must resolve node.exe from Runtime\Node only, otherwise a
-    // stale absolute path baked into the binary breaks every other computer.
     static const wchar_t* const standardPaths[] = {
         L"C:\\Program Files\\nodejs\\node.exe",
         L"C:\\Program Files (x86)\\nodejs\\node.exe"
@@ -554,19 +640,18 @@ unsigned __stdcall RunBomJob(void* raw) {
 
     std::wstring appRoot = getAppRoot();
     if (appRoot.empty() || !isDirectory(appRoot + L"\\Runtime")) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法定位软件运行环境 (Runtime 目录缺失)。");
         return 1;
     }
 
     std::wstring catPath = findCatstartPath();
     if (catPath.empty()) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"未检测到 CATIA 安装环境 (未找到 CATSTART.exe)。\n\n请确认目标机器已安装 64位 CATIA V5-6R（如 B26/B28 等版本），或设置系统环境变量 CATSTART_PATH 指向 CATSTART.exe。");
         return 1;
     }
 
-    // Portable Node.js engine (optional).  When it is missing or broken the
-    // native C++ OpenXML writer BuildFilteredBomXlsxNative() takes over, so this
-    // is no longer a fatal condition for the whole job.
     std::wstring nodePath = findNodePath(appRoot);
     std::wstring scriptPath = appRoot + L"\\Runtime\\Export\\build_filtered_bom.mjs";
     bool hasNodeEngine = !nodePath.empty() && regular(scriptPath);
@@ -574,47 +659,76 @@ unsigned __stdcall RunBomJob(void* raw) {
     std::wstring stage, temp;
     wchar_t tb[MAX_PATH + 1];
     DWORD tn = GetTempPathW(MAX_PATH, tb);
-    if (!tn || tn > MAX_PATH || !full(tb, temp) || !isDirectory(temp)) {
+    if (tn > 0 && tn <= MAX_PATH && full(tb, temp)) {
+        if (!isDirectory(temp)) {
+            CreateDirectoryW(temp.c_str(), NULL);
+        }
+    }
+    if (!isDirectory(temp) || temp.find(L' ') != std::wstring::npos) {
+        std::wstring fallback = L"C:\\Users\\Public\\CAA_BOM_V3_Temp";
+        CreateDirectoryW(fallback.c_str(), NULL);
+        if (isDirectory(fallback)) {
+            temp = fallback;
+        }
+    }
+    if (temp.empty() || !isDirectory(temp)) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法确定安全的临时目录。");
         return 1;
     }
 
     if (!regular(j.input) || !isDirectory(j.outputDir) ||
         (j.size != 600 && j.size != 800 && j.size != 1200)) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"输入文件、输出目录或分辨率设置无效。");
         return 1;
     }
 
     static LONG serial = 0;
+    DWORD lastStageErr = 0;
+    std::wstring lastAttemptStage;
     for (int i = 0; i < 50; i++) {
         wchar_t suffix[100];
-        swprintf_s(suffix, L"CAA_BOM_%lu_%lu_%ld",
+        swprintf_s(suffix, L"CAA_BOM_V3_%lu_%lu_%ld",
                    GetCurrentProcessId(), GetTickCount(), InterlockedIncrement(&serial));
         stage = temp;
         if (stage[stage.size() - 1] != L'\\') stage += L'\\';
         stage += suffix;
-        if (CreateDirectoryW(stage.c_str(), NULL)) break;
+        if (CreateDirectoryW(stage.c_str(), NULL)) {
+            lastStageErr = 0;
+            break;
+        }
+        lastStageErr = GetLastError();
+        lastAttemptStage = stage;
         stage.clear();
     }
 
     if (stage.empty()) {
-        finish(j.notify, 4, L"无法创建专用临时工作目录。");
+        wchar_t errBuf[256];
+        swprintf_s(errBuf, L"无法创建专用临时工作目录 (错误码: %lu, 尝试路径: %s)。",
+                   lastStageErr, lastAttemptStage.c_str());
+        if (j.outExitCode) *j.outExitCode = 1;
+        finish(j.notify, 4, errBuf);
         return 1;
     }
+
+    // Create subdirectories for isolated CATIA temp and error logs
+    CreateDirectoryW((stage + L"\\cat_temp").c_str(), NULL);
+    CreateDirectoryW((stage + L"\\cat_report").c_str(), NULL);
 
     // Dynamically generate isolated CATEnv in stage directory pointing to current appRoot
     std::wstring catEnvTemplatePath = appRoot + L"\\Runtime\\CATEnv\\CAA-BOM-Tiny-Release-B26.txt";
     std::string envTemplate = readFile(catEnvTemplatePath);
     if (envTemplate.empty()) {
         cleanStage(stage, temp);
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法读取 CATIA 运行环境模板文件。");
         return 1;
     }
 
-    std::string appRootNarrow = wideNarrow(appRoot);
-    std::string resolvedEnv = replaceAll(envTemplate, "C:\\BOM-gemini\\CATPart_BOM_Tool_V2\\Runtime", appRootNarrow + "\\Runtime");
-    resolvedEnv = replaceAll(resolvedEnv, "C:\\BOM-gemini\\CATPart_BOM_Tool\\Runtime", appRootNarrow + "\\Runtime");
-    resolvedEnv = replaceAll(resolvedEnv, "C:\\BOM\\CATPart_BOM_Tool\\Runtime", appRootNarrow + "\\Runtime");
+    std::string appRootNarrow = safeNarrowPath(appRoot);
+    std::string resolvedEnv = replaceAll(envTemplate, "C:\\CATPart_BOM_Tool\\Runtime", appRootNarrow + "\\Runtime");
+    resolvedEnv = replaceAll(resolvedEnv, "{{APP_RUNTIME}}", appRootNarrow + "\\Runtime");
 
     // Deduce CATIA win_b64 installation path from catPath
     std::wstring catWinB64 = catPath;
@@ -622,14 +736,21 @@ unsigned __stdcall RunBomJob(void* raw) {
     if (codeBinPos != std::wstring::npos) {
         catWinB64 = catWinB64.substr(0, codeBinPos);
     }
-    std::string catWinB64Narrow = wideNarrow(catWinB64);
+    std::string catWinB64Narrow = safeNarrowPath(catWinB64);
     if (!catWinB64Narrow.empty()) {
         resolvedEnv = replaceAll(resolvedEnv, "C:\\Program Files\\Dassault Systemes\\B26\\win_b64", catWinB64Narrow);
     }
 
-    std::wstring stagedEnvPath = stage + L"\\CAA-BOM-Tiny-Release-B26.txt";
+    // CATEnv isolation
+    std::string stageNarrow = safeNarrowPath(stage);
+    resolvedEnv = replaceAll(resolvedEnv, "CATTemp=CSIDL_LOCAL_APPDATA\\DassaultSystemes\\CATTemp", "CATTemp=" + stageNarrow + "\\cat_temp");
+    resolvedEnv = replaceAll(resolvedEnv, "CATErrorLog=CSIDL_LOCAL_APPDATA\\DassaultSystemes\\CATTemp\\error.log", "CATErrorLog=" + stageNarrow + "\\cat_temp\\error.log");
+    resolvedEnv = replaceAll(resolvedEnv, "CATReport=CSIDL_LOCAL_APPDATA\\DassaultSystemes\\CATReport", "CATReport=" + stageNarrow + "\\cat_report");
+
+    std::wstring stagedEnvPath = stage + L"\\CAA-BOM-V3-Release-B26.txt";
     if (!writeTextFile(stagedEnvPath, resolvedEnv)) {
         cleanStage(stage, temp);
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法生成运行时 CATEnv 环境配置。");
         return 1;
     }
@@ -638,24 +759,69 @@ unsigned __stdcall RunBomJob(void* raw) {
     wchar_t num[20];
     swprintf_s(num, L"%d", j.size);
     std::wstring inner = L"CAAStandalonePartWorker.exe @env @env " + std::wstring(num);
+    if (j.density > 0.0 && _finite(j.density)) {
+        wchar_t densBuf[64];
+        swprintf_s(densBuf, L" %.15g", j.density);
+        inner += densBuf;
+    }
     std::wstring cmd = quote(catPath) + L" -run " + quote(inner) +
-                       L" -env CAA-BOM-Tiny-Release-B26 -direnv " + quote(stage) + L" -nowindow";
+                       L" -env CAA-BOM-V3-Release-B26 -direnv " + quote(stage) + L" -nowindow";
 
     PROCESS_INFORMATION pi;
     std::wstring workerLog = stage + L"\\worker_launcher.log";
-    if (!launch(cmd, workerLog, &env, pi)) {
+    HANDLE workerJob = NULL;
+    if (!launch(cmd, workerLog, &env, pi, NULL, &workerJob)) {
+        cleanStage(stage, temp);
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法启动 CAA 计算进程；日志保留于：" + stage);
         return 1;
     }
 
+    DWORD startTick = GetTickCount();
+    DWORD lastActiveTick = startTick;
+    size_t lastLogSize = 0;
     int prev = -1, total = -1;
     std::wstring logfile, csvfile;
+
     for (;;) {
+        // 1. Check user cancellation
+        if (j.cancelEvent && WaitForSingleObject(j.cancelEvent, 0) == WAIT_OBJECT_0) {
+            terminateChildJob(workerJob, pi);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            std::wstring name = findOne(stage, L"capture_*.log");
+            if (!name.empty()) {
+                CopyFileW((stage + L"\\" + name).c_str(), (temp + L"\\CAA_BOM_V3_Canceled_last.log").c_str(), FALSE);
+            }
+            CopyFileW(workerLog.c_str(), (temp + L"\\CAA_BOM_V3_Canceled_worker_launcher.log").c_str(), FALSE);
+            cleanStage(stage, temp);
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 5, L"任务已由用户取消。");
+            return 1;
+        }
+
+        // 2. Check timeouts
+        DWORD now = GetTickCount();
+        if ((now - startTick > WORKER_TOTAL_TIMEOUT_MS) ||
+            (now - lastActiveTick > WORKER_HEARTBEAT_TIMEOUT_MS)) {
+            terminateChildJob(workerJob, pi);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            appendLog(workerLog, L"[timeout] worker exceeded timeout limit");
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 4, L"CAA 测量分析超时中止；中间日志保留于：" + stage);
+            return 1;
+        }
+
         DWORD w = WaitForSingleObject(pi.hProcess, 250);
         std::wstring name = findOne(stage, L"capture_*.log");
         if (!name.empty()) {
             logfile = stage + L"\\" + name;
             std::string content = readFile(logfile);
+            if (content.size() != lastLogSize) {
+                lastLogSize = content.size();
+                lastActiveTick = GetTickCount();
+            }
             total = totalCount(content);
             std::wstring id = name.substr(8, name.size() - 12);
             csvfile = stage + L"\\Entity_Analysis_" + id + L".csv";
@@ -666,8 +832,20 @@ unsigned __stdcall RunBomJob(void* raw) {
                     prev = pct;
                 }
             }
+        } else {
+            std::string wlog = readFile(workerLog);
+            if (wlog.size() != lastLogSize) {
+                lastLogSize = wlog.size();
+                lastActiveTick = GetTickCount();
+            }
         }
+
         if (w == WAIT_OBJECT_0 || w == WAIT_FAILED) break;
+    }
+
+    if (workerJob) {
+        CloseHandle(workerJob);
+        workerJob = NULL;
     }
 
     DWORD code = 1;
@@ -706,12 +884,14 @@ unsigned __stdcall RunBomJob(void* raw) {
         std::wstring msg = L"导出已中止：检测到模型中存在 " + countStr +
                            L" 个隐藏状态（NoShow）的实体（" + namesStr +
                            L"）。\n\n本程序要求模型内全部实体均处于显示状态才能执行导出。请先在 CATIA 中将所有隐藏实体设为显示状态（或清理无关隐藏实体）后再试。";
+        if (j.outExitCode) *j.outExitCode = 3;
         finish(j.notify, 4, msg);
-        return 1;
+        return 3;
     }
 
     if (code != 0 || logfile.empty() || !finalMarker(logContent) ||
         !regular(csvfile) || !validateRows(csvRows(readFile(csvfile)), groupCount(logContent), stage)) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"CAA 测量分析失败或几何数据不完整；中间日志保留于：" + stage);
         return 1;
     }
@@ -722,8 +902,6 @@ unsigned __stdcall RunBomJob(void* raw) {
     // Dual-engine Excel export
     //   engine 1 : portable Node.js  (Runtime\Node\node.exe  +  build_filtered_bom.mjs)
     //   engine 2 : native C++ OpenXML writer BuildFilteredBomXlsxNative()
-    // The native path is a full-featured fallback, so a missing / broken Node
-    // runtime can never fail the whole export again.
     // ---------------------------------------------------------------
     std::wstring stagedXlsx = stage + L"\\result.xlsx";
     std::wstring nodeLog = stage + L"\\excel_builder.log";
@@ -736,25 +914,63 @@ unsigned __stdcall RunBomJob(void* raw) {
                                quote(csvfile) + L" " + quote(stagedXlsx);
         PROCESS_INFORMATION node;
         ZeroMemory(&node, sizeof(node));
-        bool started = launch(nodeCmd, nodeLog, NULL, node, exportDir.c_str());
+        HANDLE nodeJob = NULL;
+        bool started = launch(nodeCmd, nodeLog, NULL, node, exportDir.c_str(), &nodeJob);
         if (started) {
-            DWORD wait = WaitForSingleObject(node.hProcess, INFINITE);
+            DWORD nodeStartTick = GetTickCount();
+            DWORD wait = WAIT_TIMEOUT;
+            bool nodeTimedOut = false;
+
+            while (true) {
+                if (j.cancelEvent && WaitForSingleObject(j.cancelEvent, 0) == WAIT_OBJECT_0) {
+                    terminateChildJob(nodeJob, node);
+                    CloseHandle(node.hThread);
+                    CloseHandle(node.hProcess);
+                    cleanStage(stage, temp);
+                    if (j.outExitCode) *j.outExitCode = 1;
+                    finish(j.notify, 5, L"任务已由用户取消。");
+                    return 1;
+                }
+
+                wait = WaitForSingleObject(node.hProcess, 250);
+                if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) {
+                    break;
+                }
+
+                if (GetTickCount() - nodeStartTick > NODE_TIMEOUT_MS) {
+                    nodeTimedOut = true;
+                    terminateChildJob(nodeJob, node);
+                    break;
+                }
+            }
+
+            if (nodeJob) {
+                CloseHandle(nodeJob);
+                nodeJob = NULL;
+            }
+
             DWORD exitCode = 1;
-            GetExitCodeProcess(node.hProcess, &exitCode);
+            if (!nodeTimedOut && wait == WAIT_OBJECT_0) {
+                GetExitCodeProcess(node.hProcess, &exitCode);
+            }
             CloseHandle(node.hThread);
             CloseHandle(node.hProcess);
 
-            wchar_t buf[192];
-            swprintf_s(buf, L"[node] wait=%lu exit=%lu",
-                       (unsigned long)wait, (unsigned long)exitCode);
-            appendLog(nodeLog, buf);
-
-            if (wait == WAIT_OBJECT_0 && exitCode == 0 &&
-                regular(stagedXlsx) && validXlsx(stagedXlsx)) {
-                built = true;
-                engine = L"Node.js";
+            if (nodeTimedOut) {
+                appendLog(nodeLog, L"[timeout] node engine timed out, switching to native C++ writer");
             } else {
-                appendLog(nodeLog, L"[fallback] node engine did not produce a valid .xlsx, switching to native C++ writer");
+                wchar_t buf[192];
+                swprintf_s(buf, L"[node] wait=%lu exit=%lu",
+                           (unsigned long)wait, (unsigned long)exitCode);
+                appendLog(nodeLog, buf);
+
+                if (wait == WAIT_OBJECT_0 && exitCode == 0 &&
+                    regular(stagedXlsx) && validXlsx(stagedXlsx)) {
+                    built = true;
+                    engine = L"Node.js";
+                } else {
+                    appendLog(nodeLog, L"[fallback] node engine did not produce a valid .xlsx, switching to native C++ writer");
+                }
             }
         } else {
             appendLog(nodeLog, L"[fallback] failed to start the node process, switching to native C++ writer");
@@ -775,6 +991,7 @@ unsigned __stdcall RunBomJob(void* raw) {
             std::wstring detail = nativeErr.empty()
                 ? L"原生 Excel 生成器返回失败。" : nativeErr;
             appendLog(nodeLog, L"[fallback_failed] " + detail);
+            if (j.outExitCode) *j.outExitCode = 1;
             finish(j.notify, 4, L"Excel 工作簿生成失败；详细日志保留于：" + stage + L"\n\n" + detail);
             return 1;
         }
@@ -805,6 +1022,7 @@ unsigned __stdcall RunBomJob(void* raw) {
     }
 
     if (target.empty()) {
+        if (j.outExitCode) *j.outExitCode = 1;
         finish(j.notify, 4, L"无法将生成的 Excel 写入目标目录；临时文件保留于：" + stage);
         return 1;
     }
@@ -817,14 +1035,12 @@ unsigned __stdcall RunBomJob(void* raw) {
         ? L"\n\n注意：模型中实体均为微小体并已被筛除，请查看《微小几何体筛除记录》工作表。"
         : (hasWarnings ? L"\n\n注意：模型中存在体积小于 1.0 mm³ 的微小实体，已自动筛除并记录于《微小几何体筛除记录》工作表中。" : L"");
 
-    // The .xlsx has already been verified and copied to the output directory, so
-    // a leftover temp cache is only a cosmetic nuisance - never turn a successful
-    // export into an error dialog because of it.
     if (!cleanStage(stage, temp)) {
         warning += L"\n\n注意：临时缓存未能完全清理（不影响已生成的 Excel）。如需手动清理，位置：";
         warning += stage;
     }
 
+    if (j.outExitCode) *j.outExitCode = 0;
     finish(j.notify, 3, target + warning);
     return 0;
 }

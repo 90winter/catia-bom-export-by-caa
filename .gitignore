@@ -1,11 +1,31 @@
-node_modules/
+# Build intermediates
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tmp.exe
+
+# CAA mkmk build workspace
+CAA_Build_Workspace/
+
+# Optional local Node.js runtime & dependencies (native C++ OpenXML writer is built-in)
+Runtime/Node/
+Runtime/Export/node_modules/
+
+# Test outputs & temporary logs
+TestOutput/
+*.log
+*.csv
+*.xlsx
+!Example/*.xlsx
+
+# Local binaries, CATIA models and distribution archives
 *.exe
 *.dll
-*.res
-*.obj
-*.zip
-*.[Cc][Aa][Tt][Pp][Aa][Rr][Tt]
-*.[Cc][Aa][Tt][Pp][Rr][Oo][Dd][Uu][Cc][Tt]
-*.[Cc][Aa][Tt][Dd][Rr][Aa][Ww][Ii][Nn][Gg]
+*.[Cc][Aa][Tt]*
 *.[Cc][Gg][Rr]
-*.[3][Dd][Xx][Mm][Ll]
+*.3dxml
+*.model
+*.zip

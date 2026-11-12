@@ -6,10 +6,7 @@ LINK_WITH = JS0GROUP \
             CATObjectSpecsModeler \
             CATMecModInterfaces \
             CATMechanicalModeler \
-            CATSketcherInterfaces \
             CATPartInterfaces \
-            CATMechanicalModelerUI \
-            CATApplicationFrame \
             CATVisualization \
             CATVizBase \
             CATViz \
@@ -18,7 +15,3 @@ LINK_WITH = JS0GROUP \
             CATGMGeometricInterfaces \
             CATGMOperatorsInterfaces \
             CATGMModelInterfaces
-
-
-
-

@@ -1,0 +1,41 @@
+!----------------------------------------------------------
+!   DASSAULT SYSTEMES  -  V5 ENVIRONMENT FILE
+!----------------------------------------------------------
+! MODE : Global
+! TYPE : CATIA_P3
+! TMSTMP : 1793844896
+! ARGS : -cs CATIA_P3 -a global -icon yes -menu yes -tools
+!----------------------------------------------------------
+
+CATInstallPath=C:\Program Files\Dassault Systemes\B26\win_b64
+CATDLLPath=C:\CATPart_BOM_Tool\Runtime\win_b64\code\bin;C:\Program Files\Dassault Systemes\B26\win_b64\code\bin
+CATICPath=C:\Program Files\Dassault Systemes\B26\win_b64\code\productIC
+CATCommandPath=C:\Program Files\Dassault Systemes\B26\win_b64\code\command
+CATDictionaryPath=C:\CATPart_BOM_Tool\Runtime\win_b64\code\dictionary;C:\Program Files\Dassault Systemes\B26\win_b64\code\dictionary
+CATDocView=C:\Program Files\Dassault Systemes\B26\win_b64\doc
+CATReffilesPath=C:\Program Files\Dassault Systemes\B26\win_b64\reffiles
+CATFontPath=C:\Program Files\Dassault Systemes\B26\win_b64\resources\fonts
+CATGalaxyPath=C:\Program Files\Dassault Systemes\B26\win_b64\resources\galaxy
+CATGraphicPath=C:\CATPart_BOM_Tool\Runtime\win_b64\resources\graphic;C:\CATPart_BOM_Tool\Runtime\win_b64\resources\graphic\icons;C:\CATPart_BOM_Tool\Runtime\win_b64\resources\graphic\icons\normal;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic\icons;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic\figures;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic\splashscreens;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic\symbols;C:\Program Files\Dassault Systemes\B26\win_b64\resources\graphic\textures
+CATMsgCatalogPath=C:\CATPart_BOM_Tool\Runtime\win_b64\resources\msgcatalog;C:\Program Files\Dassault Systemes\B26\win_b64\resources\msgcatalog
+CATFeatureCatalogPath=C:\Program Files\Dassault Systemes\B26\win_b64\resources\featurecatalog
+CATDefaultCollectionStandard=C:\Program Files\Dassault Systemes\B26\win_b64\resources\standard
+CATKnowledgePath=C:\Program Files\Dassault Systemes\B26\win_b64\resources\knowledge
+CATStartupPath=C:\Program Files\Dassault Systemes\B26\win_b64\startup
+CATW3ResourcesPath=C:\Program Files\Dassault Systemes\B26\win_b64\docs
+CATReconcilePath=
+CATReferenceSettingPath=
+CATUserSettingPath=CSIDL_APPDATA\DassaultSystemes\CATSettings
+CATCollectionStandard=
+CATTemp=CSIDL_LOCAL_APPDATA\DassaultSystemes\CATTemp
+CATMetasearchPath=DSKEY_TMPDIR
+CATW3PublishPath=DSKEY_TMPDIR
+CATSharedWorkbookPath=DSKEY_TMPDIR
+CATErrorLog=CSIDL_LOCAL_APPDATA\DassaultSystemes\CATTemp\error.log
+CATReport=CSIDL_LOCAL_APPDATA\DassaultSystemes\CATReport
+CATDisciplinePath=
+USER_HOME=CSIDL_PERSONAL
+JAVA_HOME=%JAVA_HOME%
+CLASSPATH_JDBC=
+CLASSPATH=%CLASSPATH_JDBC%;%CLASSPATH%
+PATH=C:\CATPart_BOM_Tool\Runtime\win_b64\code\bin;C:\Program Files\Dassault Systemes\B26\win_b64\code\bin;C:\Program Files\Dassault Systemes\B26\win_b64\code\command;%JAVA_HOME%\bin;%PATH%

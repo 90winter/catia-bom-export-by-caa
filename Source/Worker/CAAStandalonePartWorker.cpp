@@ -54,6 +54,12 @@
 #include "CATVisPropertiesValues.h"
 #include "CATShowAttribut.h"
 
+// Error Handling & Math Matrix/Vector
+#include "CATError.h"
+#include "CATErrorMacros.h"
+#include "CATMath3x3Matrix.h"
+#include "CATMathVector.h"
+
 // Convert Ansi string to UTF-8
 static std::string utf8(const char* s) {
     if (!s) return "";
@@ -102,6 +108,27 @@ static std::string wideUtf8(const std::wstring& value) {
     return s;
 }
 
+// Helper to format CATError*
+static void logCatError(FILE* f, const char* stage, CATError* err) {
+    if (!f) return;
+    if (!err) {
+        fprintf(f, "cat_error stage=%s (null error)\n", stage ? stage : "unknown");
+        return;
+    }
+    const char* msgId = err->GetMsgId();
+    std::string nlsMsg = wideUtf8(catWide(err->GetNLSMessage()));
+    char* srcFile = NULL;
+    int srcLine = 0;
+    err->GetSourceFileName(&srcFile);
+    err->GetSourceLineNumber(&srcLine);
+    fprintf(f, "cat_error stage=%s id=%s src=%s:%d msg=%s\n",
+            stage ? stage : "unknown",
+            msgId ? msgId : "",
+            srcFile ? srcFile : "",
+            srcLine,
+            nlsMsg.c_str());
+}
+
 // Check if an object is hidden (in NoShow / Invisible state)
 static bool isObjectHidden(CATBaseUnknown* unk) {
     if (!unk) return false;
@@ -126,20 +153,32 @@ struct Measurement {
     bool volumeOk;
     bool areaWarning;
     bool areaFailed;
+    bool emptyBody;
+    bool multiSolid;
+    bool inertiaOk;
     double volume;
     double area;
+    double signedArea;
     double x;
     double y;
     double z;
     double negativeAbs;
+    double inertiaEig[3];
     unsigned long tag;
     int positiveCount;
     int negativeCount;
+    std::string areaCondition;
 
     Measurement()
         : ok(false), volumeOk(false), areaWarning(false), areaFailed(false),
-          volume(0), area(0), x(0), y(0), z(0),
-          negativeAbs(0), tag(0), positiveCount(0), negativeCount(0) {}
+          emptyBody(false), multiSolid(false), inertiaOk(false),
+          volume(0.0), area(0.0), signedArea(0.0), x(0.0), y(0.0), z(0.0),
+          negativeAbs(0.0), tag(0), positiveCount(0), negativeCount(0),
+          areaCondition("area_failed") {
+        inertiaEig[0] = 0.0;
+        inertiaEig[1] = 0.0;
+        inertiaEig[2] = 0.0;
+    }
 };
 
 // Measure 3D solid body volume, surface area, and center of gravity
@@ -154,85 +193,139 @@ static Measurement measureBody(CATISpecObject_var obj, FILE* f) {
     HRESULT hr = req->GetResults(CATUnicodeString("MfDefault3DView"), results);
     bool failed = false;
 
-    if (SUCCEEDED(hr)) {
-        for (int j = 1; j <= results.Size(); j++) {
-            CATIGeometricalElement* geo = NULL;
-            if (FAILED(results[j]->QueryInterface(IID_CATIGeometricalElement, (void**)&geo)) || !geo) {
-                failed = true;
-                continue;
-            }
+    if (SUCCEEDED(hr) && results.Size() == 0) {
+        m.emptyBody = true;
+        req->Release();
+        return m;
+    }
 
-            CATBody_var body = geo->GetBodyResult();
-            if (NULL_var != body) {
-                CATTopData td;
-                CATICGMDynMassProperties3D* op = CATCGMDynCreateMassProperties3D(&td, (CATBody*)body);
-                if (op) {
-                    double vol = op->GetVolume();
-                    if (_finite(vol) && vol > 0) {
-                        CATMathPoint pt = op->GetCenterOfGravity();
-                        if (_finite(pt.GetX()) && _finite(pt.GetY()) && _finite(pt.GetZ())) {
-                            // Direct, fast, native CGM surface area calculation
-                            double area = op->GetWetArea();
+    CATTry {
+        if (SUCCEEDED(hr)) {
+            for (int j = 1; j <= results.Size(); j++) {
+                CATIGeometricalElement* geo = NULL;
+                if (FAILED(results[j]->QueryInterface(IID_CATIGeometricalElement, (void**)&geo)) || !geo) {
+                    failed = true;
+                    continue;
+                }
 
-                            // Fallback to cell iteration only if direct wet area is invalid or non-positive
-                            if (!_finite(area) || area <= 0.0) {
-                                CATLISTP(CATCell) faces;
-                                body->GetAllCells(faces, 2);
-                                area = 0.0;
-                                for (int k = 1; k <= faces.Size(); k++) {
-                                    CATICGMDynMassProperties3D* faceOp = CATCGMDynCreateMassProperties3D(&td, (CATFace*)faces[k]);
-                                    if (faceOp) {
-                                        double fa = faceOp->GetWetArea();
-                                        faceOp->Release();
-                                        if (_finite(fa)) {
-                                            area += fabs(fa);
+                CATBody_var body = geo->GetBodyResult();
+                if (NULL_var != body) {
+                    CATTopData td;
+                    CATICGMDynMassProperties3D* op = CATCGMDynCreateMassProperties3D(&td, (CATBody*)body);
+                    if (op) {
+                        double vol = op->GetVolume();
+                        if (_finite(vol) && vol > 0.0) {
+                            CATMathPoint pt = op->GetCenterOfGravity();
+                            if (_finite(pt.GetX()) && _finite(pt.GetY()) && _finite(pt.GetZ())) {
+                                double area = op->GetWetArea();
+
+                                if (_finite(area) && area > 0.0) {
+                                    m.signedArea = area;
+                                    m.negativeCount = 0;
+                                    m.negativeAbs = 0.0;
+                                    m.areaCondition = "wet_area_ok";
+                                } else {
+                                    CATLISTP(CATCell) faces;
+                                    body->GetAllCells(faces, 2);
+                                    double signedSum = 0.0;
+                                    area = 0.0;
+                                    for (int k = 1; k <= faces.Size(); k++) {
+                                        CATICGMDynMassProperties3D* faceOp = CATCGMDynCreateMassProperties3D(&td, (CATFace*)faces[k]);
+                                        if (faceOp) {
+                                            double fa = faceOp->GetWetArea();
+                                            faceOp->Release();
+                                            if (_finite(fa)) {
+                                                area += fabs(fa);
+                                                signedSum += fa;
+                                                if (fa < 0.0) {
+                                                    m.negativeCount++;
+                                                    m.negativeAbs += -fa;
+                                                }
+                                            }
                                         }
                                     }
+                                    m.signedArea = signedSum;
+                                    if (_finite(area) && area > 0.0) {
+                                        m.areaCondition = (m.negativeCount > 0) ? "fallback_faces_negative" : "fallback_faces_ok";
+                                    } else {
+                                        m.areaFailed = true;
+                                        m.areaCondition = "area_failed";
+                                    }
                                 }
-                            }
 
-                            if (!_finite(area) || area <= 0.0) {
-                                m.areaFailed = true;
-                            }
+                                CATMath3x3Matrix inertia = op->GetInertiaMatrix();
+                                int nbEig = 0;
+                                double eigVals[3] = {0.0, 0.0, 0.0};
+                                CATBoolean hasVec[3] = {FALSE, FALSE, FALSE};
+                                CATMathVector eigVecs[3];
+                                CATBoolean isDiag = FALSE;
+                                inertia.EigenVectors(nbEig, eigVals, hasVec, eigVecs, isDiag);
+                                if (nbEig == 3 && _finite(eigVals[0]) && _finite(eigVals[1]) && _finite(eigVals[2])) {
+                                    // Sort ascending: eigVals[0] <= eigVals[1] <= eigVals[2]
+                                    if (eigVals[0] > eigVals[1]) { double t = eigVals[0]; eigVals[0] = eigVals[1]; eigVals[1] = t; }
+                                    if (eigVals[1] > eigVals[2]) { double t = eigVals[1]; eigVals[1] = eigVals[2]; eigVals[2] = t; }
+                                    if (eigVals[0] > eigVals[1]) { double t = eigVals[0]; eigVals[0] = eigVals[1]; eigVals[1] = t; }
+                                    m.inertiaEig[0] = eigVals[0];
+                                    m.inertiaEig[1] = eigVals[1];
+                                    m.inertiaEig[2] = eigVals[2];
+                                    m.inertiaOk = true;
+                                }
 
-                            m.positiveCount++;
-                            m.volume = vol;
-                            m.area = area;
-                            m.x = pt.GetX();
-                            m.y = pt.GetY();
-                            m.z = pt.GetZ();
+                                m.positiveCount++;
+                                m.volume = vol;
+                                m.area = area;
+                                m.x = pt.GetX();
+                                m.y = pt.GetY();
+                                m.z = pt.GetZ();
 
-                            CATICGMObject* co = NULL;
-                            if (SUCCEEDED(body->QueryInterface(IID_CATICGMObject, (void**)&co)) && co) {
-                                m.tag = (unsigned long)co->GetPersistentTag();
-                                co->Release();
+                                CATICGMObject* co = NULL;
+                                if (SUCCEEDED(body->QueryInterface(IID_CATICGMObject, (void**)&co)) && co) {
+                                    m.tag = (unsigned long)co->GetPersistentTag();
+                                    co->Release();
+                                }
+                            } else {
+                                failed = true;
                             }
-                        } else {
+                        } else if (!_finite(vol) || vol < 0.0) {
                             failed = true;
                         }
-                    } else if (!_finite(vol) || vol < 0) {
+                        op->Release();
+                    } else {
                         failed = true;
                     }
-                    op->Release();
-                } else {
-                    failed = true;
                 }
+                geo->Release();
             }
-            geo->Release();
+        } else {
+            failed = true;
         }
-    } else {
+    }
+    CATCatch(CATError, err) {
+        logCatError(f, "measureBody", err);
         failed = true;
     }
+    CATCatchOthers {
+        fprintf(f, "cat_exception stage=measureBody unknown\n");
+        failed = true;
+    }
+    CATEndTry
 
     fprintf(f, "measurement results=%d solids=%d invalid=%d area=%.17g vol=%.17g\n",
             results.Size(), m.positiveCount, failed ? 1 : 0, m.area, m.volume);
     req->Release();
 
-    // Body is valid if exactly 1 solid result was measured with valid volume and surface area
+    if (m.positiveCount == 0 && !failed) {
+        m.emptyBody = true;
+    }
+    if (m.positiveCount > 1) {
+        m.multiSolid = true;
+    }
     m.volumeOk = !failed && m.positiveCount == 1;
-    m.areaFailed = !(_finite(m.area) && m.area > 0);
-    m.areaWarning = false;
-    m.ok = m.volumeOk && !m.areaFailed;
+    m.areaFailed = !(_finite(m.area) && m.area > 0.0);
+    if (m.volumeOk && (m.areaFailed || m.negativeCount > 0)) {
+        m.areaWarning = true;
+    }
+    m.ok = m.volumeOk && (!m.areaFailed || m.areaWarning);
 
     return m;
 }
@@ -250,7 +343,7 @@ struct Instance {
     Instance() : group(-1), tiny(false) {}
 };
 
-// Group representing identical parts grouped by volume and surface area
+// Group representing identical parts grouped by volume, surface area, and principal moments of inertia
 struct Group {
     int rep;
     std::vector<int> members;
@@ -260,8 +353,10 @@ struct Group {
     double momentZ;
     std::string image;
     bool imageOk;
+    bool imageFallback;
 
-    Group() : rep(-1), volumeSum(0), momentX(0), momentY(0), momentZ(0), imageOk(false) {}
+    Group() : rep(-1), volumeSum(0.0), momentX(0.0), momentY(0.0), momentZ(0.0),
+              imageOk(false), imageFallback(false) {}
 };
 
 static bool shouldFilterTiny(bool volumeOk, double volume) {
@@ -270,6 +365,16 @@ static bool shouldFilterTiny(bool volumeOk, double volume) {
 
 static bool nearVal(double a, double b, double absTol) {
     return fabs(a - b) <= absTol + 1e-6 * ((fabs(a) > fabs(b)) ? fabs(a) : fabs(b));
+}
+
+static bool nearInertia(const Measurement& a, const Measurement& b) {
+    if (!a.inertiaOk || !b.inertiaOk) return true;
+    for (int k = 0; k < 3; ++k) {
+        double diff = fabs(a.inertiaEig[k] - b.inertiaEig[k]);
+        double scale = (fabs(a.inertiaEig[k]) > fabs(b.inertiaEig[k])) ? fabs(a.inertiaEig[k]) : fabs(b.inertiaEig[k]);
+        if (diff > 1e-3 + 1e-3 * scale) return false;
+    }
+    return true;
 }
 
 static bool existing(const std::wstring& p) {
@@ -346,85 +451,100 @@ static int testRep(CATISpecObject_var obj, FILE* f, const std::string& temporary
 
     if (SUCCEEDED(r)) {
         CATI3DGeoVisu* vis = NULL;
-        HRESULT q = obj->QueryInterface(IID_CATI3DGeoVisu, (void**)&vis);
-        fprintf(f, "vis_qi=%08lx\n", q);
+        CATTry {
+            HRESULT q = obj->QueryInterface(IID_CATI3DGeoVisu, (void**)&vis);
+            fprintf(f, "vis_qi=%08lx\n", q);
 
-        if (vis) {
-            CATRep* rep = vis->GiveRep();
-            CAT3DRep* r3 = (CAT3DRep*)rep;
-            if (r3) {
-                CATPrint3DRepImage image(r3, renderSize, renderSize);
-                CATSupport* support = image.GetSupport();
-                CAT3DViewpoint* camera = image.GetViewpoint();
-                if (support && camera) {
-                    support->SetBackgroundColor(1.0f, 1.0f, 1.0f);
-                    support->SetAntiAliasingMode(1);
-                    camera->SetProjectionType(CYLINDRIC);
-                    camera->SetSightDirection(CATMathDirectionf(-1.0f, -1.0f, -1.0f));
-                    camera->SetUpDirection(CATMathDirectionf(0.0f, 0.0f, 1.0f));
+            if (vis) {
+                CATRep* rep = vis->GiveRep();
+                CAT3DRep* r3 = (CAT3DRep*)rep;
+                if (r3) {
+                    CATPrint3DRepImage image(r3, renderSize, renderSize);
+                    CATSupport* support = image.GetSupport();
+                    CAT3DViewpoint* camera = image.GetViewpoint();
+                    if (support && camera) {
+                        support->SetBackgroundColor(1.0f, 1.0f, 1.0f);
+                        support->SetAntiAliasingMode(1);
+                        camera->SetProjectionType(CYLINDRIC);
+                        camera->SetSightDirection(CATMathDirectionf(-1.0f, -1.0f, -1.0f));
+                        camera->SetUpDirection(CATMathDirectionf(0.0f, 0.0f, 1.0f));
 
-                    CAT3DBoundingSphere sphere = r3->GetBoundingElement();
-                    CAT3DBoundingSphere padded(sphere.GetCenter(), sphere.GetRadius() * 1.15f);
-                    camera->Reframe((float)renderSize, (float)renderSize,
-                                   support->GetMMInSupportUnit(), support->GetRatioWH(), padded);
+                        CAT3DBoundingSphere sphere = r3->GetBoundingElement();
+                        CAT3DBoundingSphere padded(sphere.GetCenter(), sphere.GetRadius() * 1.15f);
+                        camera->Reframe((float)renderSize, (float)renderSize,
+                                       support->GetMMInSupportUnit(), support->GetRatioWH(), padded);
 
-                    CATPixelImage* pix = image.Rasterize();
-                    if (pix) {
-                        int w = 0, h = 0;
-                        pix->GetSize(w, h);
-                        int wr = -999;
-                        if (w == renderSize && h == renderSize && pix->GetFormat() == RGBA) {
-                            const unsigned char* rgba = pix->GetPixelsToRead();
-                            unsigned char* rgb = new unsigned char[(size_t)w * h * 3];
-                            for (size_t z = 0; z < (size_t)w * h; z++) {
-                                unsigned int alpha = rgba[4 * z + 3];
-                                for (int c = 0; c < 3; c++) {
-                                    rgb[3 * z + c] = (unsigned char)((rgba[4 * z + c] * alpha + 255 * (255 - alpha) + 127) / 255);
-                                }
-                            }
-
-                            {
-                                CATPixelImage white(w, h, RGB, rgb, PixDeallocateNO);
-                                CATPixelImage* down = white.CreateZoomedImage(size, size, 3);
-                                if (down) {
-                                    int dw = 0, dh = 0;
-                                    down->GetSize(dw, dh);
-                                    if (dw == size && dh == size) {
-                                        wr = down->WriteToFile("PNG", temporary.c_str());
+                        CATPixelImage* pix = image.Rasterize();
+                        if (pix) {
+                            int w = 0, h = 0;
+                            pix->GetSize(w, h);
+                            int wr = -999;
+                            if (w == renderSize && h == renderSize && pix->GetFormat() == RGBA) {
+                                const unsigned char* rgba = pix->GetPixelsToRead();
+                                unsigned char* rgb = new unsigned char[(size_t)w * h * 3];
+                                for (size_t z = 0; z < (size_t)w * h; z++) {
+                                    unsigned int alpha = rgba[4 * z + 3];
+                                    for (int c = 0; c < 3; c++) {
+                                        rgb[3 * z + c] = (unsigned char)((rgba[4 * z + c] * alpha + 255 * (255 - alpha) + 127) / 255);
                                     }
-                                    down->Release();
+                                }
+
+                                {
+                                    CATPixelImage white(w, h, RGB, rgb, PixDeallocateNO);
+                                    CATPixelImage* down = white.CreateZoomedImage(size, size, 3);
+                                    if (down) {
+                                        int dw = 0, dh = 0;
+                                        down->GetSize(dw, dh);
+                                        if (dw == size && dh == size) {
+                                            wr = down->WriteToFile("PNG", temporary.c_str());
+                                        }
+                                        down->Release();
+                                    }
+                                }
+                                delete[] rgb;
+                            }
+
+                            if (wr == 0) {
+                                int nw = MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, NULL, 0);
+                                std::wstring tw(nw, L'\0');
+                                if (nw) {
+                                    MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, &tw[0], nw);
+                                }
+                                if (nw && MoveFileW(tw.c_str(), target.c_str())) {
+                                    success = 1;
+                                } else {
+                                    fprintf(f, "move_error=%lu\n", (unsigned long)GetLastError());
+                                    DeleteFileA(temporary.c_str());
                                 }
                             }
-                            delete[] rgb;
-                        }
 
-                        if (wr == 0) {
-                            int nw = MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, NULL, 0);
-                            std::wstring tw(nw, L'\0');
-                            if (nw) {
-                                MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, &tw[0], nw);
-                            }
-                            if (nw && MoveFileW(tw.c_str(), target.c_str())) {
-                                success = 1;
-                            } else {
-                                fprintf(f, "move_error=%lu\n", (unsigned long)GetLastError());
+                            if (wr != 0 && GetFileAttributesA(temporary.c_str()) != INVALID_FILE_ATTRIBUTES) {
                                 DeleteFileA(temporary.c_str());
                             }
-                        }
 
-                        if (wr != 0 && GetFileAttributesA(temporary.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                            DeleteFileA(temporary.c_str());
+                            fprintf(f, "raster=%dx%d target=%d write=%d moved=%d\n", w, h, size, wr, success);
+                            fflush(f);
+                            pix->Release();
+                        } else {
+                            fprintf(f, "raster=null\n");
                         }
-
-                        fprintf(f, "raster=%dx%d target=%d write=%d moved=%d\n", w, h, size, wr, success);
-                        fflush(f);
-                        pix->Release();
-                    } else {
-                        fprintf(f, "raster=null\n");
                     }
                 }
             }
+        }
+        CATCatch(CATError, err) {
+            logCatError(f, "testRep", err);
+            success = 0;
+        }
+        CATCatchOthers {
+            fprintf(f, "cat_exception stage=testRep unknown\n");
+            success = 0;
+        }
+        CATEndTry
+
+        if (vis) {
             vis->Release();
+            vis = NULL;
         }
 
         r = mgr->DetachFrom(vp, 0);
@@ -494,7 +614,7 @@ int main(int argc, char** argv) {
     if (wargc == 5) {
         wchar_t* end = NULL;
         density = wcstod(wargv[4], &end);
-        if (end == wargv[4] || *end != 0 || !_finite(density) || density <= 0) {
+        if (end == wargv[4] || *end != 0 || !_finite(density) || density <= 0.0) {
             fprintf(stderr, "Invalid density\n");
             return 2;
         }
@@ -551,7 +671,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (scratch[scratch.size() - 1] != L'\\') scratch += L'\\';
-    scratch += L"CAA_BOM_" + wid;
+    scratch += L"CAA_BOM_V3_" + wid;
 
     if (!CreateDirectoryW(scratch.c_str(), NULL)) {
         fprintf(f, "scratch_create_failed=%lu\nfailures=1\n", (unsigned long)GetLastError());
@@ -586,7 +706,28 @@ int main(int argc, char** argv) {
     std::wstring tempInput;
 
     if (FAILED(hr) && !doc && GetFileAttributesW(inputArg.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        tempInput = scratch + L"\\input.CATPart";
+        std::wstring baseName = inputArg;
+        size_t lastSlash = baseName.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            baseName = baseName.substr(lastSlash + 1);
+        }
+        if (isAsciiPath(baseName) && baseName.size() <= 100 && !baseName.empty()) {
+            tempInput = scratch + L"\\" + baseName;
+        } else {
+            tempInput = scratch + L"\\input.CATPart";
+        }
+
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        LARGE_INTEGER fsize;
+        fsize.QuadPart = 0;
+        if (GetFileAttributesExW(inputArg.c_str(), GetFileExInfoStandard, &fad)) {
+            fsize.LowPart = fad.nFileSizeLow;
+            fsize.HighPart = fad.nFileSizeHigh;
+        }
+        fprintf(f, "fallback_copy src=%s dst=%s size=%lld\n",
+                wideUtf8(inputArg).c_str(), wideUtf8(tempInput).c_str(), (long long)fsize.QuadPart);
+        fflush(f);
+
         if (CopyFileW(inputArg.c_str(), tempInput.c_str(), TRUE)) {
             CATUnicodeString safeInput;
             safeInput.BuildFromWChar(tempInput.c_str());
@@ -602,274 +743,357 @@ int main(int argc, char** argv) {
     fflush(f);
 
     int failures = 0, warnings = 0;
+    int exitCode = 0;
+
+    CATInit* init = NULL;
+    CATIPrtContainer* cont = NULL;
+    CATIPartRequest* request = NULL;
 
     if (SUCCEEDED(hr) && doc) {
-        CATInit* init = NULL;
         hr = doc->QueryInterface(IID_CATInit, (void**)&init);
-        CATIPrtContainer* cont = init ? (CATIPrtContainer*)init->GetRootContainer("CATIPrtContainer") : NULL;
+        if (init) {
+            cont = (CATIPrtContainer*)init->GetRootContainer("CATIPrtContainer");
+        }
 
         if (cont) {
-            CATIPrtPart_var part(cont->GetPart());
-            CATIPartRequest* request = NULL;
-            hr = part->QueryInterface(IID_CATIPartRequest, (void**)&request);
-
-            if (SUCCEEDED(hr) && request) {
-                CATLISTV(CATBaseUnknown_var) bodies;
-                hr = request->GetSolidBodies(CATUnicodeString("MfDefault3DView"), bodies);
-                fprintf(f, "GetSolidBodies=%08lx count=%d\n", hr, bodies.Size());
-                fflush(f);
-
-                if (FAILED(hr) || bodies.Size() == 0) {
-                    fprintf(f, "no root bodies or retrieval failed\n");
-                    failures++;
+            // Nested scope ensures all _var instances, bodies, part are destroyed BEFORE Remove(*doc)
+            {
+                CATIPrtPart_var part(cont->GetPart());
+                if (NULL_var != part) {
+                    hr = part->QueryInterface(IID_CATIPartRequest, (void**)&request);
+                } else {
+                    hr = E_FAIL;
                 }
 
-                // --- STRICT HIDDEN ENTITY (NoShow) SCAN ---
-                int hiddenCount = 0;
-                std::string joinedNames;
+                if (SUCCEEDED(hr) && request) {
+                    CATLISTV(CATBaseUnknown_var) bodies;
+                    hr = request->GetSolidBodies(CATUnicodeString("MfDefault3DView"), bodies);
+                    fprintf(f, "GetSolidBodies=%08lx count=%d\n", hr, bodies.Size());
+                    fflush(f);
 
-                for (int i = 1; SUCCEEDED(hr) && i <= bodies.Size(); i++) {
-                    bool hidden = isObjectHidden((CATBaseUnknown*)bodies[i]);
-                    CATIBodyRequest* bReq = NULL;
-                    if (!hidden && SUCCEEDED(bodies[i]->QueryInterface(IID_CATIBodyRequest, (void**)&bReq)) && bReq) {
-                        CATLISTV(CATBaseUnknown_var) res;
-                        if (SUCCEEDED(bReq->GetResults(CATUnicodeString("MfDefault3DView"), res))) {
-                            for (int j = 1; j <= res.Size(); ++j) {
-                                if (isObjectHidden((CATBaseUnknown*)res[j])) {
-                                    hidden = true;
-                                    break;
+                    if (FAILED(hr) || bodies.Size() == 0) {
+                        fprintf(f, "no root bodies or retrieval failed\n");
+                        failures++;
+                    }
+
+                    // --- STRICT HIDDEN ENTITY (NoShow) SCAN ---
+                    int hiddenCount = 0;
+                    std::string joinedNames;
+
+                    for (int i = 1; SUCCEEDED(hr) && i <= bodies.Size(); i++) {
+                        bool hidden = isObjectHidden((CATBaseUnknown*)bodies[i]);
+                        CATIBodyRequest* bReq = NULL;
+                        if (!hidden && SUCCEEDED(bodies[i]->QueryInterface(IID_CATIBodyRequest, (void**)&bReq)) && bReq) {
+                            CATLISTV(CATBaseUnknown_var) res;
+                            if (SUCCEEDED(bReq->GetResults(CATUnicodeString("MfDefault3DView"), res))) {
+                                for (int j = 1; j <= res.Size(); ++j) {
+                                    if (isObjectHidden((CATBaseUnknown*)res[j])) {
+                                        hidden = true;
+                                        break;
+                                    }
                                 }
                             }
+                            bReq->Release();
                         }
-                        bReq->Release();
-                    }
 
-                    if (hidden) {
-                        std::string bname;
-                        CATIAlias* alias = NULL;
-                        if (SUCCEEDED(bodies[i]->QueryInterface(IID_CATIAlias, (void**)&alias)) && alias) {
-                            bname = wideUtf8(catWide(alias->GetAlias()));
-                            alias->Release();
-                        }
-                        if (bname.empty()) {
-                            char bbuf[32];
-                            sprintf_s(bbuf, "Body_%d", i);
-                            bname = bbuf;
-                        }
-                        fprintf(f, "hidden_body index=%d name=%s\n", i, bname.c_str());
-                        hiddenCount++;
-                        if (!joinedNames.empty()) joinedNames += ", ";
-                        joinedNames += bname;
-                    }
-                }
-
-                if (hiddenCount > 0) {
-                    fprintf(f, "hidden_body_count=%d names=%s\nfailures=1\n", hiddenCount, joinedNames.c_str());
-                    fflush(f);
-
-                    request->Release();
-                    cont->Release();
-                    if (init) init->Release();
-                    CATDocumentServices::Remove(*doc);
-                    Delete_Session(sessionName);
-
-                    if (!tempInput.empty()) {
-                        if (DeleteFileW(tempInput.c_str())) fprintf(f, "temporary_copy_removed=1\n");
-                        else fprintf(f, "temporary_copy_removed=0 error=%lu\n", (unsigned long)GetLastError());
-                    }
-                    if (RemoveDirectoryW(scratch.c_str())) fprintf(f, "scratch_removed=1\n");
-                    else fprintf(f, "scratch_removed=0 error=%lu\n", (unsigned long)GetLastError());
-
-                    fclose(f);
-                    if (SUCCEEDED(c)) CoUninitialize();
-                    LocalFree(wargv);
-                    return 3; // Exit code 3: Model contains hidden (NoShow) entities
-                }
-
-                // --- GEOMETRIC MEASUREMENT & GROUPING ---
-                std::vector<Instance> instances;
-                std::vector<Group> groups;
-                int filtered = 0;
-
-                for (int i = 1; SUCCEEDED(hr) && i <= bodies.Size(); i++) {
-                    Instance item;
-                    item.obj = CATISpecObject_var(bodies[i]);
-                    if (NULL_var == item.obj) {
-                        fprintf(f, "body %d no spec\n", i);
-                        failures++;
-                        continue;
-                    }
-
-                    CATIAlias_var alias(item.obj);
-                    CATUnicodeString aliasString = (NULL_var != alias) ? alias->GetAlias() : CATUnicodeString("");
-                    item.displayWide = catWide(aliasString);
-                    item.display = wideUtf8(item.displayWide);
-                    item.feature = wideUtf8(catWide(item.obj->GetName()));
-
-                    fprintf(f, "measure_begin=%d/%d\n", i, bodies.Size());
-                    fflush(f);
-
-                    item.m = measureBody(item.obj, f);
-                    int pos = (int)instances.size();
-
-                    if (shouldFilterTiny(item.m.volumeOk, item.m.volume)) {
-                        item.tiny = true;
-                        filtered++;
-                        warnings++;
-                        fprintf(f, "tiny_volume body=%d volume_mm3=%.17g\n", i, item.m.volume);
-                    } else if (item.m.ok) {
-                        for (size_t j = 0; j < groups.size(); j++) {
-                            const Measurement& ref = instances[groups[j].rep].m;
-                            if (ref.ok &&
-                                nearVal(item.m.volume, ref.volume, 1e-6) &&
-                                nearVal(item.m.area, ref.area, 1e-4)) {
-                                item.group = (int)j;
-                                break;
+                        if (hidden) {
+                            std::string bname;
+                            CATIAlias* alias = NULL;
+                            if (SUCCEEDED(bodies[i]->QueryInterface(IID_CATIAlias, (void**)&alias)) && alias) {
+                                bname = wideUtf8(catWide(alias->GetAlias()));
+                                alias->Release();
                             }
+                            if (bname.empty()) {
+                                char bbuf[32];
+                                sprintf_s(bbuf, "Body_%d", i);
+                                bname = bbuf;
+                            }
+                            fprintf(f, "hidden_body index=%d name=%s\n", i, bname.c_str());
+                            hiddenCount++;
+                            if (!joinedNames.empty()) joinedNames += ", ";
+                            joinedNames += bname;
                         }
-                        if (item.group < 0) {
-                            Group g;
-                            g.rep = pos;
-                            groups.push_back(g);
-                            item.group = (int)groups.size() - 1;
-                        }
-                        Group& g = groups[item.group];
-                        g.members.push_back(pos);
-                        g.volumeSum += item.m.volume;
-                        g.momentX += item.m.volume * item.m.x;
-                        g.momentY += item.m.volume * item.m.y;
-                        g.momentZ += item.m.volume * item.m.z;
-                    } else {
-                        failures++;
                     }
 
-                    instances.push_back(item);
-                    fprintf(f, "measure_done=%d/%d group=%d status=%s\n",
-                            i, bodies.Size(), item.group + 1,
-                            item.tiny ? "tiny_volume" : (item.m.ok ? "ok" : "failed"));
-                    fflush(f);
-                }
-
-                int groupedCount = 0;
-                for (size_t z = 0; z < groups.size(); z++) {
-                    groupedCount += (int)groups[z].members.size();
-                }
-                fprintf(f, "filter_summary total=%d filtered=%d grouped=%d ungrouped=%d\n",
-                        bodies.Size(), filtered, groupedCount, bodies.Size() - filtered - groupedCount);
-                fprintf(f, "group_count=%d\n", (int)groups.size());
-                fflush(f);
-
-                // --- RENDERING PREVIEW IMAGES FOR UNIQUE GROUPS ---
-                for (size_t k = 0; k < groups.size(); k++) {
-                    Group& g = groups[k];
-                    Instance& item = instances[g.rep];
-                    std::wstring wfilename = uniqueName(out, item.displayWide);
-                    g.image = wideUtf8(wfilename);
-                    std::wstring target = out + wfilename;
-
-                    char tempName[160];
-                    sprintf_s(tempName, "group_%02d_%lu_%s.png", (int)k + 1, item.m.tag, runid);
-                    std::string temporary = scratchA + "\\" + tempName;
-
-                    if (existing(target) || GetFileAttributesA(temporary.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                        fprintf(f, "output collision group=%d\n", (int)k + 1);
-                    } else {
-                        fprintf(f, "render_group_begin=%d/%d\n", (int)k + 1, (int)groups.size());
+                    if (hiddenCount > 0) {
+                        fprintf(f, "hidden_body_count=%d names=%s\nfailures=1\n", hiddenCount, joinedNames.c_str());
                         fflush(f);
-                        g.imageOk = testRep(item.obj, f, temporary, target, size) != 0;
-                    }
-                    if (!g.imageOk) failures++;
-                    fprintf(f, "render_group_done=%d/%d status=%s\n",
-                            (int)k + 1, (int)groups.size(), g.imageOk ? "ok" : "failed");
-                    fflush(f);
-                }
-
-                // --- OUTPUT GROUP CSV ---
-                FILE* csv = _wfopen(csvPath.c_str(), L"wb");
-                if (!csv) {
-                    fprintf(f, "group CSV open failed\n");
-                    failures++;
-                } else {
-                    fwrite("\xEF\xBB\xBF", 1, 3, csv); // UTF-8 BOM
-                    fprintf(csv, "index,display_name,quantity,area_mm2,volume_mm3,total_volume_mm3,cx_mm,cy_mm,cz_mm,image,status,volume_moment_x_mm4,volume_moment_y_mm4,volume_moment_z_mm4,member_indices\r\n");
-                    for (size_t k = 0; k < groups.size(); k++) {
-                        Group& g = groups[k];
-                        Instance& item = instances[g.rep];
-                        fprintf(csv, "%d,", (int)k + 1);
-                        csvField(csv, item.display);
-                        fprintf(csv, ",%d,", (int)g.members.size());
-                        if (item.m.ok) fprintf(csv, "%.15g", item.m.area);
-                        fprintf(csv, ",%.15g,%.15g,%.15g,%.15g,%.15g,",
-                                item.m.volume, g.volumeSum,
-                                g.momentX / g.volumeSum, g.momentY / g.volumeSum, g.momentZ / g.volumeSum);
-                        csvField(csv, g.image);
-                        fprintf(csv, ",%s,%.15g,%.15g,%.15g,\"",
-                                g.imageOk ? "ok" : "image_failed",
-                                g.momentX, g.momentY, g.momentZ);
-                        for (size_t j = 0; j < g.members.size(); j++) {
-                            if (j) fputc(';', csv);
-                            fprintf(csv, "%d", g.members[j] + 1);
-                        }
-                        fprintf(csv, "\"\r\n");
-                    }
-                    fclose(csv);
-                }
-
-                // --- OUTPUT INSTANCES CSV ---
-                std::wstring instancePath = out + L"Instances_" + wid + L".csv";
-                if (existing(instancePath)) {
-                    fprintf(f, "instance CSV exists\n");
-                    failures++;
-                } else {
-                    FILE* ins = _wfopen(instancePath.c_str(), L"wb");
-                    if (!ins) {
-                        fprintf(f, "instance CSV open failed\n");
-                        failures++;
+                        exitCode = 3;
                     } else {
-                        fwrite("\xEF\xBB\xBF", 1, 3, ins); // UTF-8 BOM
-                        fprintf(ins, "index,group_index,display_name,feature_name,tag,area_mm2,volume_mm3,cx_mm,cy_mm,cz_mm,mass_g,image,status,area_raw_signed_mm2,negative_face_count,negative_area_abs_mm2,area_condition\r\n");
-                        for (size_t i = 0; i < instances.size(); i++) {
-                            Instance& item = instances[i];
-                            fprintf(ins, "%d,%d,", (int)i + 1, item.group + 1);
-                            csvField(ins, item.display);
-                            fputc(',', ins);
-                            csvField(ins, item.feature);
-                            fprintf(ins, ",%lu,", item.m.tag);
-                            if (item.m.ok) fprintf(ins, "%.15g,", item.m.area);
-                            else fprintf(ins, ",");
+                        // --- GEOMETRIC MEASUREMENT & GROUPING ---
+                        std::vector<Instance> instances;
+                        std::vector<Group> groups;
+                        int filtered = 0;
 
-                            if (item.m.volumeOk) {
-                                fprintf(ins, "%.15g,%.15g,%.15g,%.15g,%.15g,",
-                                        item.m.volume, item.m.x, item.m.y, item.m.z,
-                                        item.m.volume * density * 1e-6);
-                            } else {
-                                fprintf(ins, ",,,,,");
+                        for (int i = 1; SUCCEEDED(hr) && i <= bodies.Size(); i++) {
+                            Instance item;
+                            item.obj = CATISpecObject_var(bodies[i]);
+                            if (NULL_var == item.obj) {
+                                fprintf(f, "body %d no spec\n", i);
+                                failures++;
+                                continue;
                             }
 
-                            csvField(ins, item.group >= 0 ? groups[item.group].image : "");
-                            fprintf(ins, ",%s,",
-                                    item.tiny ? "tiny_volume" :
-                                    (item.m.ok ? (item.group >= 0 && groups[item.group].imageOk ? "ok" : "image_failed") :
-                                     "measurement_failed"));
-                            fprintf(ins, ",,,ok\r\n");
+                            CATIAlias_var alias(item.obj);
+                            CATUnicodeString aliasString = (NULL_var != alias) ? alias->GetAlias() : CATUnicodeString("");
+                            item.displayWide = catWide(aliasString);
+                            item.display = wideUtf8(item.displayWide);
+                            item.feature = wideUtf8(catWide(item.obj->GetName()));
+
+                            fprintf(f, "measure_begin=%d/%d\n", i, bodies.Size());
+                            fflush(f);
+
+                            item.m = measureBody(item.obj, f);
+
+                            if (item.m.emptyBody) {
+                                fprintf(f, "empty_body index=%d name=%s\n", i, item.display.c_str());
+                                warnings++;
+                                continue;
+                            }
+
+                            if (item.m.multiSolid) {
+                                fprintf(f, "multi_solid_body index=%d name=%s solids=%d\n", i, item.display.c_str(), item.m.positiveCount);
+                            }
+
+                            int pos = (int)instances.size();
+
+                            if (shouldFilterTiny(item.m.volumeOk, item.m.volume)) {
+                                item.tiny = true;
+                                filtered++;
+                                warnings++;
+                                fprintf(f, "tiny_volume body=%d volume_mm3=%.17g\n", i, item.m.volume);
+                            } else if (item.m.ok) {
+                                if (item.m.areaWarning) {
+                                    warnings++;
+                                    Group g;
+                                    g.rep = pos;
+                                    groups.push_back(g);
+                                    item.group = (int)groups.size() - 1;
+                                } else {
+                                    for (size_t j = 0; j < groups.size(); j++) {
+                                        const Instance& repInst = instances[groups[j].rep];
+                                        const Measurement& ref = repInst.m;
+                                        if (ref.ok && !ref.areaWarning &&
+                                            nearVal(item.m.volume, ref.volume, 1e-6) &&
+                                            nearVal(item.m.area, ref.area, 1e-4) &&
+                                            nearInertia(item.m, ref)) {
+                                            item.group = (int)j;
+                                            break;
+                                        }
+                                    }
+                                    if (item.group < 0) {
+                                        Group g;
+                                        g.rep = pos;
+                                        groups.push_back(g);
+                                        item.group = (int)groups.size() - 1;
+                                    }
+                                }
+                                Group& g = groups[item.group];
+                                g.members.push_back(pos);
+                                g.volumeSum += item.m.volume;
+                                g.momentX += item.m.volume * item.m.x;
+                                g.momentY += item.m.volume * item.m.y;
+                                g.momentZ += item.m.volume * item.m.z;
+                            } else {
+                                failures++;
+                            }
+
+                            instances.push_back(item);
+                            fprintf(f, "measure_done=%d/%d group=%d status=%s\n",
+                                    i, bodies.Size(), item.group + 1,
+                                    item.tiny ? "tiny_volume" : (item.m.ok ? (item.m.areaWarning ? "area_warning" : "ok") : "failed"));
+                            fflush(f);
                         }
-                        fclose(ins);
-                    }
+
+                        int groupedCount = 0;
+                        for (size_t z = 0; z < groups.size(); z++) {
+                            groupedCount += (int)groups[z].members.size();
+                        }
+                        fprintf(f, "filter_summary total=%d filtered=%d grouped=%d ungrouped=%d\n",
+                                bodies.Size(), filtered, groupedCount, bodies.Size() - filtered - groupedCount);
+                        fprintf(f, "group_count=%d\n", (int)groups.size());
+                        fflush(f);
+
+                        // --- RENDERING PREVIEW IMAGES FOR UNIQUE GROUPS ---
+                        for (size_t k = 0; k < groups.size(); k++) {
+                            Group& g = groups[k];
+                            Instance& item = instances[g.rep];
+                            std::wstring wfilename = uniqueName(out, item.displayWide);
+                            g.image = wideUtf8(wfilename);
+                            std::wstring target = out + wfilename;
+
+                            char tempName[160];
+                            sprintf_s(tempName, "group_%02d_%lu_%s.png", (int)k + 1, item.m.tag, runid);
+                            std::string temporary = scratchA + "\\" + tempName;
+
+                            if (existing(target) || GetFileAttributesA(temporary.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                                fprintf(f, "output collision group=%d\n", (int)k + 1);
+                                failures++;
+                            } else {
+                                fprintf(f, "render_group_begin=%d/%d\n", (int)k + 1, (int)groups.size());
+                                fflush(f);
+                                int repOk = testRep(item.obj, f, temporary, target, size);
+                                if (!repOk) {
+                                    fprintf(f, "render_retry group=%d\n", (int)k + 1);
+                                    fflush(f);
+                                    repOk = testRep(item.obj, f, temporary, target, size);
+                                }
+                                if (repOk) {
+                                    g.imageOk = true;
+                                } else {
+                                    unsigned char* whiteRgb = new unsigned char[(size_t)size * size * 3];
+                                    memset(whiteRgb, 255, (size_t)size * size * 3);
+                                    CATPixelImage fallbackImg(size, size, RGB, whiteRgb, PixDeallocateNO);
+                                    int wr = fallbackImg.WriteToFile("PNG", temporary.c_str());
+                                    delete[] whiteRgb;
+
+                                    int nw = MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, NULL, 0);
+                                    std::wstring tw(nw, L'\0');
+                                    if (nw) {
+                                        MultiByteToWideChar(CP_ACP, 0, temporary.c_str(), -1, &tw[0], nw);
+                                    }
+                                    if (wr == 0 && nw && MoveFileW(tw.c_str(), target.c_str())) {
+                                        g.imageOk = true;
+                                        g.imageFallback = true;
+                                        warnings++;
+                                        fprintf(f, "render_fallback_blank group=%d\n", (int)k + 1);
+                                    } else {
+                                        if (GetFileAttributesA(temporary.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                                            DeleteFileA(temporary.c_str());
+                                        }
+                                        g.imageOk = false;
+                                        failures++;
+                                        fprintf(f, "render_fallback_failed group=%d\n", (int)k + 1);
+                                    }
+                                }
+                            }
+                            fprintf(f, "render_group_done=%d/%d status=%s\n",
+                                    (int)k + 1, (int)groups.size(), g.imageOk ? "ok" : "failed");
+                            fflush(f);
+                        }
+
+                        // --- OUTPUT GROUP CSV ---
+                        FILE* csv = _wfopen(csvPath.c_str(), L"wb");
+                        if (!csv) {
+                            fprintf(f, "group CSV open failed\n");
+                            failures++;
+                        } else {
+                            fwrite("\xEF\xBB\xBF", 1, 3, csv); // UTF-8 BOM
+                            fprintf(csv, "index,display_name,quantity,area_mm2,volume_mm3,total_volume_mm3,cx_mm,cy_mm,cz_mm,image,status,volume_moment_x_mm4,volume_moment_y_mm4,volume_moment_z_mm4,member_indices\r\n");
+                            for (size_t k = 0; k < groups.size(); k++) {
+                                Group& g = groups[k];
+                                Instance& item = instances[g.rep];
+                                fprintf(csv, "%d,", (int)k + 1);
+                                csvField(csv, item.display);
+                                fprintf(csv, ",%d,", (int)g.members.size());
+                                if (!item.m.areaFailed && _finite(item.m.area) && item.m.area > 0.0) {
+                                    fprintf(csv, "%.15g", item.m.area);
+                                }
+                                fprintf(csv, ",%.15g,%.15g,%.15g,%.15g,%.15g,",
+                                        item.m.volume, g.volumeSum,
+                                        g.momentX / g.volumeSum, g.momentY / g.volumeSum, g.momentZ / g.volumeSum);
+                                csvField(csv, g.image);
+                                const char* statusStr = (item.m.areaWarning || g.imageFallback) ? "area_warning" : "ok";
+                                fprintf(csv, ",%s,%.15g,%.15g,%.15g,\"",
+                                        statusStr,
+                                        g.momentX, g.momentY, g.momentZ);
+                                for (size_t j = 0; j < g.members.size(); j++) {
+                                    if (j) fputc(';', csv);
+                                    fprintf(csv, "%d", g.members[j] + 1);
+                                }
+                                fprintf(csv, "\"\r\n");
+                            }
+                            fclose(csv);
+                        }
+
+                        // --- OUTPUT INSTANCES CSV ---
+                        std::wstring instancePath = out + L"Instances_" + wid + L".csv";
+                        if (existing(instancePath)) {
+                            fprintf(f, "instance CSV exists\n");
+                            failures++;
+                        } else {
+                            FILE* ins = _wfopen(instancePath.c_str(), L"wb");
+                            if (!ins) {
+                                fprintf(f, "instance CSV open failed\n");
+                                failures++;
+                            } else {
+                                fwrite("\xEF\xBB\xBF", 1, 3, ins); // UTF-8 BOM
+                                fprintf(ins, "index,group_index,display_name,feature_name,tag,area_mm2,volume_mm3,cx_mm,cy_mm,cz_mm,mass_g,image,status,area_raw_signed_mm2,negative_face_count,negative_area_abs_mm2,area_condition\r\n");
+                                for (size_t i = 0; i < instances.size(); i++) {
+                                    Instance& item = instances[i];
+                                    fprintf(ins, "%d,%d,", (int)i + 1, item.group + 1);
+                                    csvField(ins, item.display);
+                                    fputc(',', ins);
+                                    csvField(ins, item.feature);
+                                    fprintf(ins, ",%lu,", item.m.tag);
+                                    if (!item.m.areaFailed && _finite(item.m.area) && item.m.area > 0.0) {
+                                        fprintf(ins, "%.15g,", item.m.area);
+                                    } else {
+                                        fprintf(ins, ",");
+                                    }
+
+                                    if (item.m.volumeOk) {
+                                        fprintf(ins, "%.15g,%.15g,%.15g,%.15g,%.15g,",
+                                                item.m.volume, item.m.x, item.m.y, item.m.z,
+                                                item.m.volume * density * 1e-6);
+                                    } else {
+                                        fprintf(ins, ",,,,,");
+                                    }
+
+                                    bool fallbackImg = (item.group >= 0 && groups[item.group].imageFallback);
+                                    csvField(ins, item.group >= 0 ? groups[item.group].image : "");
+                                    const char* statusStr = "ok";
+                                    if (item.tiny) {
+                                        statusStr = "tiny_volume";
+                                    } else if (item.m.areaWarning || fallbackImg) {
+                                        statusStr = "area_warning";
+                                    } else {
+                                        statusStr = "ok";
+                                    }
+                                    fprintf(ins, ",%s,", statusStr);
+
+                                    if (!item.m.areaFailed && _finite(item.m.signedArea)) {
+                                        fprintf(ins, "%.15g,", item.m.signedArea);
+                                    } else {
+                                        fprintf(ins, ",");
+                                    }
+                                    fprintf(ins, "%d,%.15g,%s\r\n",
+                                            item.m.negativeCount,
+                                            item.m.negativeAbs,
+                                            item.m.areaCondition.c_str());
+                                }
+                                fclose(ins);
+                            }
+                        }
+                    } // end else (hiddenCount == 0)
+                } else {
+                    fprintf(f, "CATIPartRequest failed=%08lx\n", hr);
+                    failures++;
                 }
-                request->Release();
-            } else {
-                fprintf(f, "CATIPartRequest failed=%08lx\n", hr);
-                failures++;
-            }
-            cont->Release();
+            } // inner scope: all _var variables destroyed before DocumentServices::Remove
         } else {
             fprintf(f, "CATIPrtContainer unavailable\n");
             failures++;
         }
-        if (init) init->Release();
-        CATDocumentServices::Remove(*doc);
     } else {
         failures++;
+    }
+
+    if (request) {
+        request->Release();
+        request = NULL;
+    }
+    if (cont) {
+        cont->Release();
+        cont = NULL;
+    }
+    if (init) {
+        init->Release();
+        init = NULL;
+    }
+    if (doc) {
+        CATDocumentServices::Remove(*doc);
+        doc = NULL;
     }
 
     Delete_Session(sessionName);
@@ -895,5 +1119,5 @@ int main(int argc, char** argv) {
     if (SUCCEEDED(c)) CoUninitialize();
     LocalFree(wargv);
 
-    return failures ? 1 : 0;
+    return (exitCode != 0) ? exitCode : (failures ? 1 : 0);
 }
