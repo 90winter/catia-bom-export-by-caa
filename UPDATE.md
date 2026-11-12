@@ -2,7 +2,72 @@
 
 本文档记录 `CATPart 实体 BOM 生成工具` 在近期迭代中的主要问题修复与细节调整。
 
-本项目是一个用于解析单个 `.CATPart` 多实体（Multi-Body）零件、提取基础几何属性（体积、表面积、重心）并汇总生成 Excel 明细表的小工具。V3 版本主要针对此前使用过程中暴露出的异常退出、后台进程残留、偶发异形件误合并以及临时目录清理不彻底等问题做了针对性修补。
+本项目是一个用于解析单个 `.CATPart` 多实体（Multi-Body）零件、提取基础几何属性（体积、表面积、重心）并汇总生成 Excel 明细表的小工具。
+
+---
+
+## V04（v4.0.0）
+
+### 1. CAA Worker 隐藏实体与警告/状态语义对齐 (`Source/Worker/CAAStandalonePartWorker.cpp`)
+
+- **修正隐藏实体（NoShow）分支的日志冲突**
+  - **问题**：检测到 `hiddenCount > 0` 时，隐藏实体分支内部会先输出一行 `failures=1`，而主函数在收尾阶段又会输出最终的 `failures=N` 汇总，导致同一份日志中出现两个互相矛盾的 `failures` 字段，容易被前端判定为解析异常。
+  - **调整**：隐藏实体分支只记录 `hidden_body_count=N names=...` 并累加 `failures`，`failures=` 字段统一由主函数收口输出一次。
+
+- **主惯性矩校验补充 `inertiaOk` 前置判断**
+  - **问题**：V03 在任一实体的惯性矩不可用时跳过该项校验，仍可能按体积和表面积归并。
+  - **调整**：`nearInertia()` 在任一实体 `!inertiaOk` 时直接返回 `false`；惯性测量失败的实体按单件成组，并在状态列标记 `inertia_warning`，保证不会因缺失数据发生错误归并。
+
+- **警告细分计数与组合状态标记**
+  - 新增输出 `warning_breakdown tiny=... empty_body=... area_warning=... render_fallback=... inertia_fallback=...`，使各类警告可独立统计。
+  - 引入 `composeWarningStatus()` 组合状态标记函数，当单个实体同时存在多种警告时（如表面积异常叠加渲染回退），状态列会拼接成组合标识而非互相覆盖。
+  - `empty_body` 实例同步写入 `Instances_*.csv`，确保明细表与《异常与警告明细》工作表的记录能够一一对应。
+
+- **`Entity_Analysis_*.csv` 补充质量与惯性数据**
+  - 在原有列之后追加输出 `density_kg_m3,unit_mass_g,total_mass_g,inertia_eig1,inertia_eig2,inertia_eig3`，便于脱离 Excel 直接核对密度换算与主惯性矩结果。
+
+- **后台心跳线程与可控测试钩子**
+  - 新增独立心跳线程，每 `2000ms` 以及每个关键阶段（会话建立、文档打开、测量、渲染、导出）立即刷新 `heartbeat_<wid>.txt`，前端根据心跳判断后台是否仍有响应。心跳不表示几何计算已推进，任务仍受总时限约束。
+  - 新增环境变量测试钩子：`CAA_FORCE_INERTIA_FAIL`（强制惯性测量失败）、`CAA_FORCE_RENDER_FAIL`（强制渲染回退）、`CAA_SIMULATE_DELAY_MS`（注入延时），便于在不构造异常模型的前提下复现各类降级路径。
+
+---
+
+### 2. 自定义密度参数全链路打通与双引擎一致性 (`Source/UI/pipeline.cpp`, `Source/UI/xlsx_builder.cpp`, `Source/Export/build_filtered_bom.mjs`, `Runtime/Export/build_filtered_bom.mjs`)
+
+- **问题**：命令行 `/c` 模式与界面输入的自定义密度此前只在部分环节生效——Node.js 导出脚本未接收到密度参数，原生 C++ 生成器也未获得该值，导致两种引擎产出的表格在材料行与重量列上不一致。
+
+- **调整**：
+  - `pipeline.cpp` 调用 Node.js 导出脚本时补传第 3 个位置参数（`j.density`）；调用原生生成器 `BuildFilteredBomXlsxNative` 时同样传入 `j.density`。
+  - 双引擎在 `customDensity > 0` 时，均在《材料密度》工作表第 21 行写入「自定义密度」条目，并同步调整主表公式引用与缓存值，保证公式重算结果与静态缓存一致。
+
+---
+
+### 3. 异常与警告明细工作表与前端分项提示 (`Source/UI/xlsx_builder.cpp`, `Source/Export/build_filtered_bom.mjs`, `Source/UI/pipeline.cpp`)
+
+- **新增《异常与警告明细》工作表**
+  - 双引擎在检测到存在状态既非 `ok`、也非 `tiny_volume` 的异常实例时，额外生成一张《异常与警告明细》工作表，逐条记录实体名称、状态标识与异常原因；无异常时该工作表不生成，保持输出文件精简。
+
+- **前端按异常类型分项提示**
+  - **问题**：旧版一律将渲染回退、惯性测量失败等警告笼统归类为「微小实体已筛除」，提示信息与实际情况不符。
+  - **调整**：`pipeline.cpp` 解析 Worker 输出的 `warning_breakdown`，按 `tiny` / `empty_body` / `area_warning` / `render_warning` / `inertia_warning` 分别给出对应提示文案。
+
+- **校验逻辑放行组合状态**
+  - `validateRows()` 改用 `isValidGroupStatus()` 校验状态列，允许组合状态标记通过，避免因多警告拼接导致整行被判为非法而丢弃。
+
+---
+
+### 4. 超时、取消与进程启动鲁棒性 (`Source/UI/pipeline.cpp`, `Source/UI/xlsx_builder.h`, `Source/UI/xlsx_builder.cpp`)
+
+- **超时策略统一为 30 分钟并优先采信心跳**
+  - `WORKER_TOTAL_TIMEOUT_MS` 与 `TASK_TOTAL_TIMEOUT_MS` 统一调整为 `1800000`（30 分钟）。
+  - 无响应判定改为优先监听 `heartbeat_*.txt` 的修改时间与活跃状态，日志长时间无输出不再直接等同于进程卡死。
+
+- **修复 `launch()` 的句柄与挂起进程遗留问题**
+  - Job 绑定或线程恢复失败时，终止并回收已创建的子进程。Job 配置不可用时记录诊断信息。
+
+- **原生导出支持中断检查**
+  - `BuildFilteredBomXlsxNative` 新增 `cancelEvent` 与 `deadlineTick` 参数，在写入过程中分段检查取消信号与超时时间。
+  - `pipeline.cpp` 在把生成结果拷贝到目标路径前再次校验取消信号，在提交前收到取消信号时中止输出。
 
 ---
 

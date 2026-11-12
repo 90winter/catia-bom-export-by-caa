@@ -9,6 +9,9 @@
 #include <math.h>
 #include <float.h>
 #include <wctype.h>
+#include <stdarg.h>
+#include <process.h>
+#include <share.h>
 
 // CATIA / CAA Session & Document Services
 #include "CATSession.h"
@@ -147,6 +150,107 @@ static bool isObjectHidden(CATBaseUnknown* unk) {
     return hidden;
 }
 
+// ---------------------------------------------------------------------------
+// Background heartbeat thread (Audit Finding #6)
+// Writes heartbeat_<wid>.txt every 2000 ms (and immediately on every stage
+// change) so an external watchdog can tell a live-but-slow worker apart from a
+// hung/terminated one. The file is opened with _SH_DENYNO for concurrent reads.
+// ---------------------------------------------------------------------------
+static CRITICAL_SECTION g_hbLock;
+static bool g_hbLockReady = false;
+static HANDLE g_hbThread = NULL;
+static volatile LONG g_hbStopFlag = 0;
+static DWORD g_hbStartTick = 0;
+static std::wstring g_hbPath;
+static char g_hbStage[64] = "Init";
+static char g_hbDetail[160] = "";
+
+static void writeHeartbeat() {
+    if (!g_hbLockReady) return;
+    wchar_t path[1024];
+    char stage[64];
+    char detail[160];
+    DWORD startTick = 0;
+
+    EnterCriticalSection(&g_hbLock);
+    if (g_hbPath.empty() || g_hbPath.size() >= 1000) {
+        LeaveCriticalSection(&g_hbLock);
+        return;
+    }
+    wcscpy_s(path, 1024, g_hbPath.c_str());
+    strcpy_s(stage, sizeof(stage), g_hbStage);
+    strcpy_s(detail, sizeof(detail), g_hbDetail);
+    startTick = g_hbStartTick;
+    LeaveCriticalSection(&g_hbLock);
+
+    FILE* hb = _wfsopen(path, L"wb", _SH_DENYNO);
+    if (!hb) return;
+    DWORD tick = GetTickCount();
+    fprintf(hb, "tick=%lu\nelapsed_ms=%lu\nstage=%s\ndetail=%s\n",
+            (unsigned long)tick, (unsigned long)(tick - startTick), stage, detail);
+    fclose(hb);
+}
+
+static void setWorkerStage(const char* stage, const char* detail) {
+    if (!g_hbLockReady) return;
+    EnterCriticalSection(&g_hbLock);
+    strcpy_s(g_hbStage, sizeof(g_hbStage), stage ? stage : "");
+    strcpy_s(g_hbDetail, sizeof(g_hbDetail), detail ? detail : "");
+    LeaveCriticalSection(&g_hbLock);
+    writeHeartbeat();
+}
+
+static void setWorkerStageF(const char* stage, const char* fmt, ...) {
+    char detail[160];
+    detail[0] = '\0';
+    if (fmt) {
+        va_list args;
+        va_start(args, fmt);
+        vsprintf_s(detail, sizeof(detail), fmt, args);
+        va_end(args);
+    }
+    setWorkerStage(stage, detail);
+}
+
+static unsigned __stdcall heartbeatThreadProc(void* param) {
+    (void)param;
+    while (g_hbStopFlag == 0) {
+        writeHeartbeat();
+        // Sleep in 100 ms slices so stop requests are honoured quickly.
+        for (int k = 0; k < 20 && g_hbStopFlag == 0; k++) {
+            Sleep(100);
+        }
+    }
+    return 0;
+}
+
+static void startHeartbeat(const std::wstring& path) {
+    if (!g_hbLockReady) {
+        InitializeCriticalSection(&g_hbLock);
+        g_hbLockReady = true;
+    }
+    EnterCriticalSection(&g_hbLock);
+    g_hbPath = path;
+    g_hbStartTick = GetTickCount();
+    strcpy_s(g_hbStage, sizeof(g_hbStage), "Init");
+    g_hbDetail[0] = '\0';
+    LeaveCriticalSection(&g_hbLock);
+
+    g_hbStopFlag = 0;
+    unsigned tid = 0;
+    g_hbThread = (HANDLE)_beginthreadex(NULL, 0, heartbeatThreadProc, NULL, 0, &tid);
+    writeHeartbeat();
+}
+
+static void stopHeartbeat() {
+    if (g_hbThread) {
+        g_hbStopFlag = 1;
+        WaitForSingleObject(g_hbThread, 5000);
+        CloseHandle(g_hbThread);
+        g_hbThread = NULL;
+    }
+}
+
 // Geometry measurement results
 struct Measurement {
     bool ok;
@@ -156,6 +260,7 @@ struct Measurement {
     bool emptyBody;
     bool multiSolid;
     bool inertiaOk;
+    bool inertiaWarning;
     double volume;
     double area;
     double signedArea;
@@ -171,7 +276,7 @@ struct Measurement {
 
     Measurement()
         : ok(false), volumeOk(false), areaWarning(false), areaFailed(false),
-          emptyBody(false), multiSolid(false), inertiaOk(false),
+          emptyBody(false), multiSolid(false), inertiaOk(false), inertiaWarning(false),
           volume(0.0), area(0.0), signedArea(0.0), x(0.0), y(0.0), z(0.0),
           negativeAbs(0.0), tag(0), positiveCount(0), negativeCount(0),
           areaCondition("area_failed") {
@@ -184,6 +289,23 @@ struct Measurement {
 // Measure 3D solid body volume, surface area, and center of gravity
 static Measurement measureBody(CATISpecObject_var obj, FILE* f) {
     Measurement m;
+
+    // Optional test hooks (used by the audit verification harness)
+    bool forceInertiaFailOn = false;
+    {
+        wchar_t forceInertiaFail[16] = {0};
+        if (GetEnvironmentVariableW(L"CAA_FORCE_INERTIA_FAIL", forceInertiaFail, 16) > 0 && wcscmp(forceInertiaFail, L"1") == 0) {
+            forceInertiaFailOn = true;
+        }
+    }
+    {
+        wchar_t simDelay[32] = {0};
+        if (GetEnvironmentVariableW(L"CAA_SIMULATE_DELAY_MS", simDelay, 32) > 0) {
+            int delayMs = _wtoi(simDelay);
+            if (delayMs > 0 && delayMs <= 600000) Sleep((DWORD)delayMs);
+        }
+    }
+
     CATIBodyRequest* req = NULL;
     if (FAILED(obj->QueryInterface(IID_CATIBodyRequest, (void**)&req)) || !req) {
         return m;
@@ -230,6 +352,10 @@ static Measurement measureBody(CATISpecObject_var obj, FILE* f) {
                                     double signedSum = 0.0;
                                     area = 0.0;
                                     for (int k = 1; k <= faces.Size(); k++) {
+                                        // Keep the heartbeat fresh during very slow fallback face loops.
+                                        if ((k % 250) == 0) {
+                                            setWorkerStageF("MeasureBody", "fallback face %d/%d", k, faces.Size());
+                                        }
                                         CATICGMDynMassProperties3D* faceOp = CATCGMDynCreateMassProperties3D(&td, (CATFace*)faces[k]);
                                         if (faceOp) {
                                             double fa = faceOp->GetWetArea();
@@ -269,6 +395,10 @@ static Measurement measureBody(CATISpecObject_var obj, FILE* f) {
                                     m.inertiaEig[1] = eigVals[1];
                                     m.inertiaEig[2] = eigVals[2];
                                     m.inertiaOk = true;
+                                }
+                                if (forceInertiaFailOn) {
+                                    m.inertiaOk = false;
+                                    m.inertiaEig[0] = m.inertiaEig[1] = m.inertiaEig[2] = 0.0;
                                 }
 
                                 m.positiveCount++;
@@ -310,8 +440,9 @@ static Measurement measureBody(CATISpecObject_var obj, FILE* f) {
     }
     CATEndTry
 
-    fprintf(f, "measurement results=%d solids=%d invalid=%d area=%.17g vol=%.17g\n",
-            results.Size(), m.positiveCount, failed ? 1 : 0, m.area, m.volume);
+    fprintf(f, "measurement results=%d solids=%d invalid=%d area=%.17g vol=%.17g cx=%.17g cy=%.17g cz=%.17g inertia_ok=%d i1=%.17g i2=%.17g i3=%.17g\n",
+            results.Size(), m.positiveCount, failed ? 1 : 0, m.area, m.volume,
+            m.x, m.y, m.z, m.inertiaOk ? 1 : 0, m.inertiaEig[0], m.inertiaEig[1], m.inertiaEig[2]);
     req->Release();
 
     if (m.positiveCount == 0 && !failed) {
@@ -368,13 +499,27 @@ static bool nearVal(double a, double b, double absTol) {
 }
 
 static bool nearInertia(const Measurement& a, const Measurement& b) {
-    if (!a.inertiaOk || !b.inertiaOk) return true;
+    // Conservative grouping: without principal moments we refuse to merge bodies,
+    // otherwise geometrically different solids could collapse into one BOM line.
+    if (!a.inertiaOk || !b.inertiaOk) return false;
     for (int k = 0; k < 3; ++k) {
         double diff = fabs(a.inertiaEig[k] - b.inertiaEig[k]);
         double scale = (fabs(a.inertiaEig[k]) > fabs(b.inertiaEig[k])) ? fabs(a.inertiaEig[k]) : fabs(b.inertiaEig[k]);
         if (diff > 1e-3 + 1e-3 * scale) return false;
     }
     return true;
+}
+
+// Compose a distinct, self-describing status string for a group / instance row
+static const char* composeWarningStatus(bool areaWarn, bool renderWarn, bool inertiaWarn) {
+    if (areaWarn && renderWarn && inertiaWarn) return "area_render_inertia_warning";
+    if (areaWarn && renderWarn) return "area_render_warning";
+    if (areaWarn && inertiaWarn) return "area_inertia_warning";
+    if (renderWarn && inertiaWarn) return "render_inertia_warning";
+    if (areaWarn) return "area_warning";
+    if (renderWarn) return "render_warning";
+    if (inertiaWarn) return "inertia_warning";
+    return "ok";
 }
 
 static bool existing(const std::wstring& p) {
@@ -432,6 +577,16 @@ static std::wstring uniqueName(const std::wstring& out, const std::wstring& name
 static int testRep(CATISpecObject_var obj, FILE* f, const std::string& temporary, const std::wstring& target, int size) {
     int success = 0;
     int renderSize = size * 2; // Always 2x supersampling
+
+    // Optional test hook (used by the audit verification harness)
+    {
+        wchar_t forceRenderFail[16] = {0};
+        if (GetEnvironmentVariableW(L"CAA_FORCE_RENDER_FAIL", forceRenderFail, 16) > 0 && wcscmp(forceRenderFail, L"1") == 0) {
+            fprintf(f, "render_forced_fail=1\n");
+            fflush(f);
+            return 0;
+        }
+    }
 
     CATPathElement* path = new CATPathElement(obj);
     CATVisManager* mgr = CATVisManager::GetVisManager();
@@ -651,6 +806,7 @@ int main(int argc, char** argv) {
 
     std::wstring logPath = out + L"capture_" + wid + L".log";
     std::wstring csvPath = out + L"Entity_Analysis_" + wid + L".csv";
+    std::wstring heartbeatPath = out + L"heartbeat_" + wid + L".txt";
 
     if (existing(logPath) || existing(csvPath)) {
         fprintf(stderr, "Run output already exists\n");
@@ -684,24 +840,32 @@ int main(int argc, char** argv) {
     fprintf(f, "scratch_created=1\n");
     fflush(f);
 
+    // Start the background heartbeat so watchdogs can watch progress from here on.
+    startHeartbeat(heartbeatPath);
+
     HRESULT c = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     char sessionName[] = "CAAEntitySession";
     CATSession* session = NULL;
+    setWorkerStage("Create_Session", "creating CATIA session");
     HRESULT hr = Create_Session(sessionName, session);
     fprintf(f, "Create_Session=%08lx size=%d density_kg_m3=%.15g\n", hr, size, density);
     fflush(f);
 
     if (FAILED(hr) || !session) {
+        setWorkerStage("Cleanup", "session creation failed");
         RemoveDirectoryW(scratch.c_str());
         fclose(f);
         if (SUCCEEDED(c)) CoUninitialize();
+        stopHeartbeat();
         LocalFree(wargv);
         return 1;
     }
+    setWorkerStageF("Create_Session", "ok hr=%08lx", (unsigned long)hr);
 
     CATDocument* doc = NULL;
     CATUnicodeString input;
     input.BuildFromWChar(inputArg.c_str());
+    setWorkerStage("OpenDocument", wideUtf8(inputArg).c_str());
     hr = CATDocumentServices::OpenDocument(input, doc, TRUE);
     std::wstring tempInput;
 
@@ -745,6 +909,13 @@ int main(int argc, char** argv) {
     int failures = 0, warnings = 0;
     int exitCode = 0;
 
+    // Distinct warning categories (Audit Finding #2)
+    int tinyCount = 0;
+    int emptyBodyCount = 0;
+    int areaWarningCount = 0;
+    int renderFallbackCount = 0;
+    int inertiaFallbackCount = 0;
+
     CATInit* init = NULL;
     CATIPrtContainer* cont = NULL;
     CATIPartRequest* request = NULL;
@@ -779,6 +950,7 @@ int main(int argc, char** argv) {
                     // --- STRICT HIDDEN ENTITY (NoShow) SCAN ---
                     int hiddenCount = 0;
                     std::string joinedNames;
+                    setWorkerStageF("HiddenEntityScan", "scanning %d bodies", bodies.Size());
 
                     for (int i = 1; SUCCEEDED(hr) && i <= bodies.Size(); i++) {
                         bool hidden = isObjectHidden((CATBaseUnknown*)bodies[i]);
@@ -816,8 +988,12 @@ int main(int argc, char** argv) {
                     }
 
                     if (hiddenCount > 0) {
-                        fprintf(f, "hidden_body_count=%d names=%s\nfailures=1\n", hiddenCount, joinedNames.c_str());
+                        // NOTE: failures=%d is printed once at the end of main(); do not
+                        // emit an intermediate failures=1 line here (it used to conflict
+                        // with the trailing failures=0 summary).
+                        fprintf(f, "hidden_body_count=%d names=%s\n", hiddenCount, joinedNames.c_str());
                         fflush(f);
+                        failures++;
                         exitCode = 3;
                     } else {
                         // --- GEOMETRIC MEASUREMENT & GROUPING ---
@@ -843,11 +1019,20 @@ int main(int argc, char** argv) {
                             fprintf(f, "measure_begin=%d/%d\n", i, bodies.Size());
                             fflush(f);
 
+                            setWorkerStageF("MeasureBody", "%d/%d", i, bodies.Size());
                             item.m = measureBody(item.obj, f);
 
                             if (item.m.emptyBody) {
+                                // An empty body is a reportable condition, not a silently
+                                // dropped entity: keep it in the instance table with no
+                                // group (group index 0 in the CSV) and flag it.
                                 fprintf(f, "empty_body index=%d name=%s\n", i, item.display.c_str());
+                                emptyBodyCount++;
                                 warnings++;
+                                item.group = -1;
+                                instances.push_back(item);
+                                fprintf(f, "measure_done=%d/%d group=0 status=empty_body\n", i, bodies.Size());
+                                fflush(f);
                                 continue;
                             }
 
@@ -859,12 +1044,27 @@ int main(int argc, char** argv) {
 
                             if (shouldFilterTiny(item.m.volumeOk, item.m.volume)) {
                                 item.tiny = true;
+                                tinyCount++;
                                 filtered++;
                                 warnings++;
                                 fprintf(f, "tiny_volume body=%d volume_mm3=%.17g\n", i, item.m.volume);
                             } else if (item.m.ok) {
                                 if (item.m.areaWarning) {
+                                    areaWarningCount++;
                                     warnings++;
+                                    Group g;
+                                    g.rep = pos;
+                                    groups.push_back(g);
+                                    item.group = (int)groups.size() - 1;
+                                } else if (!item.m.inertiaOk) {
+                                    // Without principal moments of inertia we cannot prove
+                                    // geometric identity, so this body must NOT be merged
+                                    // into an existing group; give it its own group and
+                                    // mark the measurement as an inertia fallback.
+                                    item.m.inertiaWarning = true;
+                                    inertiaFallbackCount++;
+                                    warnings++;
+                                    fprintf(f, "inertia_unavailable body=%d name=%s\n", i, item.display.c_str());
                                     Group g;
                                     g.rep = pos;
                                     groups.push_back(g);
@@ -901,7 +1101,9 @@ int main(int argc, char** argv) {
                             instances.push_back(item);
                             fprintf(f, "measure_done=%d/%d group=%d status=%s\n",
                                     i, bodies.Size(), item.group + 1,
-                                    item.tiny ? "tiny_volume" : (item.m.ok ? (item.m.areaWarning ? "area_warning" : "ok") : "failed"));
+                                    item.tiny ? "tiny_volume"
+                                              : (item.m.ok ? composeWarningStatus(item.m.areaWarning, false, item.m.inertiaWarning)
+                                                           : "failed"));
                             fflush(f);
                         }
 
@@ -918,6 +1120,7 @@ int main(int argc, char** argv) {
                         for (size_t k = 0; k < groups.size(); k++) {
                             Group& g = groups[k];
                             Instance& item = instances[g.rep];
+                            setWorkerStageF("RenderGroup", "%d/%d", (int)k + 1, (int)groups.size());
                             std::wstring wfilename = uniqueName(out, item.displayWide);
                             g.image = wideUtf8(wfilename);
                             std::wstring target = out + wfilename;
@@ -955,6 +1158,7 @@ int main(int argc, char** argv) {
                                     if (wr == 0 && nw && MoveFileW(tw.c_str(), target.c_str())) {
                                         g.imageOk = true;
                                         g.imageFallback = true;
+                                        renderFallbackCount++;
                                         warnings++;
                                         fprintf(f, "render_fallback_blank group=%d\n", (int)k + 1);
                                     } else {
@@ -973,13 +1177,14 @@ int main(int argc, char** argv) {
                         }
 
                         // --- OUTPUT GROUP CSV ---
+                        setWorkerStage("WriteCSV", "Group CSV");
                         FILE* csv = _wfopen(csvPath.c_str(), L"wb");
                         if (!csv) {
                             fprintf(f, "group CSV open failed\n");
                             failures++;
                         } else {
                             fwrite("\xEF\xBB\xBF", 1, 3, csv); // UTF-8 BOM
-                            fprintf(csv, "index,display_name,quantity,area_mm2,volume_mm3,total_volume_mm3,cx_mm,cy_mm,cz_mm,image,status,volume_moment_x_mm4,volume_moment_y_mm4,volume_moment_z_mm4,member_indices\r\n");
+                            fprintf(csv, "index,display_name,quantity,area_mm2,volume_mm3,total_volume_mm3,cx_mm,cy_mm,cz_mm,image,status,volume_moment_x_mm4,volume_moment_y_mm4,volume_moment_z_mm4,member_indices,density_kg_m3,unit_mass_g,total_mass_g,inertia_eig1,inertia_eig2,inertia_eig3\r\n");
                             for (size_t k = 0; k < groups.size(); k++) {
                                 Group& g = groups[k];
                                 Instance& item = instances[g.rep];
@@ -993,7 +1198,7 @@ int main(int argc, char** argv) {
                                         item.m.volume, g.volumeSum,
                                         g.momentX / g.volumeSum, g.momentY / g.volumeSum, g.momentZ / g.volumeSum);
                                 csvField(csv, g.image);
-                                const char* statusStr = (item.m.areaWarning || g.imageFallback) ? "area_warning" : "ok";
+                                const char* statusStr = composeWarningStatus(item.m.areaWarning, g.imageFallback, item.m.inertiaWarning);
                                 fprintf(csv, ",%s,%.15g,%.15g,%.15g,\"",
                                         statusStr,
                                         g.momentX, g.momentY, g.momentZ);
@@ -1001,12 +1206,25 @@ int main(int argc, char** argv) {
                                     if (j) fputc(';', csv);
                                     fprintf(csv, "%d", g.members[j] + 1);
                                 }
-                                fprintf(csv, "\"\r\n");
+                                // Density / derived masses (g) followed by the principal
+                                // moments of inertia (mm^5 scaled by density -> mm^4 units
+                                // as returned by CATIA). Empty fields when unavailable.
+                                fprintf(csv, "\",%.15g,%.15g,%.15g,",
+                                        density,
+                                        item.m.volume * density * 1e-6,
+                                        g.volumeSum * density * 1e-6);
+                                if (item.m.inertiaOk) {
+                                    fprintf(csv, "%.15g,%.15g,%.15g", item.m.inertiaEig[0], item.m.inertiaEig[1], item.m.inertiaEig[2]);
+                                } else {
+                                    fprintf(csv, ",,");
+                                }
+                                fprintf(csv, "\r\n");
                             }
                             fclose(csv);
                         }
 
                         // --- OUTPUT INSTANCES CSV ---
+                        setWorkerStage("WriteCSV", "Instances CSV");
                         std::wstring instancePath = out + L"Instances_" + wid + L".csv";
                         if (existing(instancePath)) {
                             fprintf(f, "instance CSV exists\n");
@@ -1043,12 +1261,12 @@ int main(int argc, char** argv) {
                                     bool fallbackImg = (item.group >= 0 && groups[item.group].imageFallback);
                                     csvField(ins, item.group >= 0 ? groups[item.group].image : "");
                                     const char* statusStr = "ok";
-                                    if (item.tiny) {
+                                    if (item.m.emptyBody) {
+                                        statusStr = "empty_body";
+                                    } else if (item.tiny) {
                                         statusStr = "tiny_volume";
-                                    } else if (item.m.areaWarning || fallbackImg) {
-                                        statusStr = "area_warning";
                                     } else {
-                                        statusStr = "ok";
+                                        statusStr = composeWarningStatus(item.m.areaWarning, fallbackImg, item.m.inertiaWarning);
                                     }
                                     fprintf(ins, ",%s,", statusStr);
 
@@ -1060,7 +1278,7 @@ int main(int argc, char** argv) {
                                     fprintf(ins, "%d,%.15g,%s\r\n",
                                             item.m.negativeCount,
                                             item.m.negativeAbs,
-                                            item.m.areaCondition.c_str());
+                                            item.m.emptyBody ? "empty_body" : item.m.areaCondition.c_str());
                                 }
                                 fclose(ins);
                             }
@@ -1079,6 +1297,7 @@ int main(int argc, char** argv) {
         failures++;
     }
 
+    setWorkerStage("Cleanup", "releasing CATIA resources");
     if (request) {
         request->Release();
         request = NULL;
@@ -1112,9 +1331,14 @@ int main(int argc, char** argv) {
         failures++;
     }
 
+    fprintf(f, "warning_breakdown tiny=%d empty_body=%d area_warning=%d render_fallback=%d inertia_fallback=%d\n",
+            tinyCount, emptyBodyCount, areaWarningCount, renderFallbackCount, inertiaFallbackCount);
     fprintf(f, "warnings=%d\n", warnings);
     fprintf(f, "failures=%d\n", failures);
     fclose(f);
+
+    setWorkerStage("Done", "finished");
+    stopHeartbeat();
 
     if (SUCCEEDED(c)) CoUninitialize();
     LocalFree(wargv);

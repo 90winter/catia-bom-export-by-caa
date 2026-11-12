@@ -47,10 +47,50 @@ function parseCsv(text) {
   return rows;
 }
 
-const [csvPath, outputPath] = process.argv.slice(2);
-if (!csvPath || !outputPath) {
-  throw new Error('Usage: node build_filtered_bom.mjs groups.csv output.xlsx');
+// 合法的（非致命）实例 / 分组状态码，需与 CAA worker 输出保持一致
+const WARNING_STATUSES = [
+  'area_warning',
+  'render_warning',
+  'inertia_warning',
+  'area_render_warning',
+  'area_inertia_warning',
+  'render_inertia_warning',
+  'area_render_inertia_warning'
+];
+const VALID_GROUP_STATUSES = ['ok', ...WARNING_STATUSES];
+const VALID_INSTANCE_STATUSES = ['tiny_volume', 'empty_body', ...VALID_GROUP_STATUSES];
+
+function statusLabelOf(status) {
+  if (status === 'empty_body') return '空几何体';
+  const parts = [];
+  if (status.includes('area')) parts.push('表面积异常');
+  if (status.includes('render')) parts.push('预览渲染异常');
+  if (status.includes('inertia')) parts.push('惯性矩异常');
+  return parts.length ? parts.join(' + ') : '未归类异常';
 }
+
+function statusNoteOf(status) {
+  if (status === 'empty_body') {
+    return '空几何体（无三维实体），未生成体积与质心数据，已跳过';
+  }
+  const parts = [];
+  if (status.includes('area')) parts.push('表面积测量异常（已按保守值处理）');
+  if (status.includes('render')) parts.push('预览图渲染失败（已使用空白占位图）');
+  if (status.includes('inertia')) parts.push('主惯性矩不可用（已保守单列，未参与归并）');
+  return parts.length ? parts.join('；') : '未归类的异常状态';
+}
+
+const [csvPath, outputPath, customDensityArg] = process.argv.slice(2);
+if (!csvPath || !outputPath) {
+  throw new Error('Usage: node build_filtered_bom.mjs groups.csv output.xlsx [customDensity]');
+}
+
+const customDensity = Number(customDensityArg);
+const hasCustomDensity =
+  customDensityArg !== undefined &&
+  String(customDensityArg).trim() !== '' &&
+  Number.isFinite(customDensity) &&
+  customDensity > 0;
 
 const matrix = parseCsv(await fs.readFile(csvPath, 'utf8'));
 const head = matrix.shift();
@@ -62,8 +102,8 @@ for (const k of ['index', 'display_name', 'quantity', 'area_mm2', 'volume_mm3', 
 
 const data = matrix.filter(x => x.length > 1);
 for (const d of data) {
-  if (!['ok', 'area_warning'].includes(d[ix.status])) {
-    throw new Error('Incomplete group data: ' + d[ix.index]);
+  if (!VALID_GROUP_STATUSES.includes(d[ix.status])) {
+    throw new Error('Incomplete group data: ' + d[ix.index] + ' (status=' + d[ix.status] + ')');
   }
 }
 
@@ -99,7 +139,15 @@ const materials = [
   ['铜', 8900, '金属材料', '膨胀阀配件、螺纹嵌件、导电端子及铜管件']
 ];
 
-const matLastRow = materials.length + 1; // 20
+// 命令行 / 外部指定的自定义密度：作为第 21 行材料追加
+if (hasCustomDensity) {
+  materials.push(['自定义密度', customDensity, '自定义材料', '命令行/外部指定密度']);
+}
+
+// 列 F 默认使用的材料牌号
+const defaultMaterial = hasCustomDensity ? '自定义密度' : 'PP-TD20';
+
+const matLastRow = materials.length + 1; // 20 / 21
 
 m.getRange(`A1:D1`).values = [['材料牌号 / 名称', '典型密度 (kg/m³)', '材料类别', '汽车工程典型应用场景说明']];
 m.getRange(`A1:D1`).format = {
@@ -116,7 +164,7 @@ m.getRange(`A2:D${matLastRow}`).format = {
   verticalAlignment: 'center'
 };
 m.getRange(`A2:B${matLastRow}`).format.fill = '#FFF2D5';
-m.getRange(`B2:B${matLastRow}`).setNumberFormat('#,##0');
+m.getRange(`B2:B${matLastRow}`).setNumberFormat(hasCustomDensity ? '#,##0.###' : '#,##0');
 m.getRange(`A1:D${matLastRow}`).format.borders = { preset: 'all', style: 'thin', color: '#C4CDD4' };
 
 const noteRow = matLastRow + 2;
@@ -200,7 +248,7 @@ for (let i = 0; i < n; i++) {
     count,
     v,
     tv,
-    'PP-TD20',
+    defaultMaterial,
     null,
     null,
     x,
@@ -318,10 +366,15 @@ for (const k of ['index', 'group_index', 'display_name', 'feature_name', 'tag', 
 
 const ar = instanceRows.filter(d => d.length > 1);
 const tiny = ar.filter(d => d[ii.status] === 'tiny_volume');
-const invalid = ar.filter(d => !['tiny_volume', 'ok', 'area_warning'].includes(d[ii.status]));
-if (invalid.length) throw new Error('Invalid instance status detected in instances file');
+const emptyBodies = ar.filter(d => d[ii.status] === 'empty_body');
+const anomalies = ar.filter(d => !['ok', 'tiny_volume'].includes(d[ii.status]));
+const invalid = ar.filter(d => !VALID_INSTANCE_STATUSES.includes(d[ii.status]));
+if (invalid.length) {
+  throw new Error('Invalid instance status detected in instances file: ' + invalid[0][ii.status]);
+}
 
-if (ar.length !== tiny.length + data.reduce((a, d) => a + Number(d[ix.quantity]), 0)) {
+if (ar.length !== tiny.length + emptyBodies.length +
+    data.reduce((a, d) => a + Number(d[ix.quantity]), 0)) {
   throw new Error('Instance counts do not match group quantities');
 }
 
@@ -334,6 +387,8 @@ const toNum = (d, k) => {
 
 let audit = null;
 let av = [];
+let warnSheet = null;
+let wv = [];
 if (tiny.length > 0) {
   audit = wb.worksheets.add('微小几何体筛除记录');
   audit.showGridLines = false;
@@ -378,6 +433,47 @@ if (tiny.length > 0) {
   audit.getRange(`E2:H${tiny.length + 1}`).setNumberFormat('#,##0.00');
   audit.getRange(`A1:K${tiny.length + 1}`).format.borders = { preset: 'all', style: 'thin', color: '#D9E0E5' };
   audit.freezePanes.freezeRows(1);
+}
+
+// -------------------------------------------------------------
+// Sheet 4: 异常与警告明细 (Created only if any non-ok instance exists)
+//   empty_body / area_warning / render_warning / inertia_warning ...
+// -------------------------------------------------------------
+if (anomalies.length > 0) {
+  warnSheet = wb.worksheets.add('异常与警告明细');
+  warnSheet.showGridLines = false;
+  warnSheet.getRange('A1:F1').values = [[
+    '实例序号',
+    '实体名称',
+    '特征名称',
+    '体标签',
+    '异常状态',
+    '说明'
+  ]];
+  warnSheet.getRange('A1:F1').format = {
+    fill: '#28465B',
+    font: { name: 'Arial', bold: true, color: '#FFFFFF', size: 10 },
+    wrapText: true,
+    verticalAlignment: 'center'
+  };
+  warnSheet.getRange('A1:F1').format.rowHeight = 32;
+
+  wv = anomalies.map(d => [
+    toNum(d, 'index'),
+    d[ii.display_name],
+    d[ii.feature_name],
+    toNum(d, 'tag'),
+    statusLabelOf(d[ii.status]),
+    statusNoteOf(d[ii.status])
+  ]);
+
+  warnSheet.getRange(`A2:F${anomalies.length + 1}`).values = wv;
+  warnSheet.getRange(`A2:F${anomalies.length + 1}`).format.font = { name: 'Arial', size: 10, color: '#202C35' };
+  warnSheet.getRange(`A2:F${anomalies.length + 1}`).format.verticalAlignment = 'center';
+  warnSheet.getRange(`A2:A${anomalies.length + 1}`).setNumberFormat('#,##0');
+  warnSheet.getRange(`D2:D${anomalies.length + 1}`).setNumberFormat('#,##0');
+  warnSheet.getRange(`A1:F${anomalies.length + 1}`).format.borders = { preset: 'all', style: 'thin', color: '#D9E0E5' };
+  warnSheet.freezePanes.freezeRows(1);
 }
 
 // -------------------------------------------------------------
@@ -455,6 +551,23 @@ if (audit) {
     }
     const fitted = Math.max(auditMinWidths[c], Math.min(70, Math.ceil(maxW + 4)));
     audit.getRange(`${colLetter}1:${colLetter}${tiny.length + 1}`).format.columnWidth = fitted;
+  }
+}
+
+// Column widths for 《异常与警告明细》 if created
+if (warnSheet) {
+  const warnMinWidths = [10, 28, 20, 14, 24, 70];
+  const warnRows = [warnSheet.getRange('A1:F1').values[0], ...wv];
+  for (let c = 0; c < 6; c++) {
+    const colLetter = letter(c);
+    let maxW = 0;
+    for (const row of warnRows) {
+      if (row && row[c] !== undefined) {
+        maxW = Math.max(maxW, widthFor(row[c]));
+      }
+    }
+    const fitted = Math.max(warnMinWidths[c], Math.min(80, Math.ceil(maxW + 4)));
+    warnSheet.getRange(`${colLetter}1:${colLetter}${anomalies.length + 1}`).format.columnWidth = fitted;
   }
 }
 

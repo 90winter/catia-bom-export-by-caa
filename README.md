@@ -1,8 +1,8 @@
-# CATPart 实体 BOM 生成工具 V03
+# CATPart 实体 BOM 生成工具 V04
 
 这是一个基于 **CATIA V5 CAA C++** 与 **Win32** 的辅助小工具，用于在脱机/无界面模式下读取单个 `.CATPart` 文件中的多实体（Multi-Body）几何数据，统计体积、重心与数量，并导出带预览缩略图的 Excel 明细表（`.xlsx`）。
 
-关于近期版本的具体问题修复与改动记录，请参阅 [UPDATE.md](./UPDATE.md)。
+[下载 V04 Windows 便携版](https://github.com/90winter/catia-bom-export-by-caa/releases/tag/v4.0.0) · [查看更新说明](./UPDATE.md)
 
 ---
 
@@ -25,8 +25,6 @@
 ---
 
 ## 二、 环境要求与使用方法
-
-[下载 V03 Windows 便携版](https://github.com/90winter/catia-bom-export-by-caa/releases/tag/v3.0.0)。请先解压，再运行主程序。
 
 ### 运行环境要求
 - **操作系统**：Windows 7 / 10 / 11（64 位）

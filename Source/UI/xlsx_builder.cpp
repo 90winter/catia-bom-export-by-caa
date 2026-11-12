@@ -233,6 +233,98 @@ static bool toNumber(const std::string& s, double& out) {
 }
 
 // ---------------------------------------------------------------------------
+// 取消 / 超时 检查（原生写入器全程可中断）
+// ---------------------------------------------------------------------------
+
+// 返回 true 表示应当立即中止生成；errMsg 已被填写。
+static bool checkAbort(HANDLE cancelEvent, DWORD deadlineTick, bool hasDeadline,
+                       std::wstring& errMsg, bool* outCanceled, bool* outTimedOut) {
+    if (cancelEvent != NULL && cancelEvent != INVALID_HANDLE_VALUE &&
+        WaitForSingleObject(cancelEvent, 0) == WAIT_OBJECT_0) {
+        if (outCanceled) *outCanceled = true;
+        errMsg = L"任务已由用户取消。";
+        return true;
+    }
+    if (hasDeadline && deadlineTick != 0 && (LONG)(GetTickCount() - deadlineTick) >= 0) {
+        if (outTimedOut) *outTimedOut = true;
+        errMsg = L"Excel 工作簿生成超时中止。";
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 状态 / 异常说明（与 CAA worker 的 status 字段保持一致）
+// ---------------------------------------------------------------------------
+
+// 分组 CSV 与实例 CSV 中都可能出现的合法（非致命）状态
+static bool isKnownStatus(const std::string& s) {
+    static const char* const kStatuses[] = {
+        "ok",
+        "area_warning",
+        "render_warning",
+        "inertia_warning",
+        "area_render_warning",
+        "area_inertia_warning",
+        "render_inertia_warning",
+        "area_render_inertia_warning"
+    };
+    for (size_t i = 0; i < sizeof(kStatuses) / sizeof(kStatuses[0]); i++) {
+        if (s == kStatuses[i]) return true;
+    }
+    return false;
+}
+
+// 把 "area_render_inertia_warning" 之类的状态翻译成中文工程说明
+static std::string statusNote(const std::string& status) {
+    if (status == "empty_body") {
+        return utf8(L"空几何体（无三维实体），未生成体积与质心数据，已跳过");
+    }
+    std::vector<std::string> parts;
+    if (status.find("area") != std::string::npos) {
+        parts.push_back(utf8(L"表面积测量异常（已按保守值处理）"));
+    }
+    if (status.find("render") != std::string::npos) {
+        parts.push_back(utf8(L"预览图渲染失败（已使用空白占位图）"));
+    }
+    if (status.find("inertia") != std::string::npos) {
+        parts.push_back(utf8(L"主惯性矩不可用（已保守单列，未参与归并）"));
+    }
+    if (parts.empty()) {
+        parts.push_back(utf8(L"未归类的异常状态"));
+    }
+    std::string out;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (i) out += utf8(L"；");
+        out += parts[i];
+    }
+    return out;
+}
+
+// 把 "area_render_inertia_warning" 之类的状态码翻译成简短的中文标签
+static std::string statusLabel(const std::string& status) {
+    if (status == "empty_body") {
+        return utf8(L"空几何体");
+    }
+    std::string out;
+    if (status.find("area") != std::string::npos) {
+        out += utf8(L"表面积异常");
+    }
+    if (status.find("render") != std::string::npos) {
+        if (!out.empty()) out += utf8(L" + ");
+        out += utf8(L"预览渲染异常");
+    }
+    if (status.find("inertia") != std::string::npos) {
+        if (!out.empty()) out += utf8(L" + ");
+        out += utf8(L"惯性矩异常");
+    }
+    if (out.empty()) {
+        out = utf8(L"未归类异常");
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // CRC32 (IEEE 802.3) + Deflate “stored” 压缩块
 // ---------------------------------------------------------------------------
 
@@ -298,7 +390,13 @@ struct ZipEntry {
     std::string data;
 };
 
-static std::string buildZip(const std::vector<ZipEntry>& entries) {
+static std::string buildZip(const std::vector<ZipEntry>& entries,
+                            HANDLE cancelEvent,
+                            DWORD deadlineTick,
+                            bool hasDeadline,
+                            std::wstring& errMsg,
+                            bool* outCanceled,
+                            bool* outTimedOut) {
     std::string out;
     std::string central;
 
@@ -312,6 +410,10 @@ static std::string buildZip(const std::vector<ZipEntry>& entries) {
                                           (st.wDay & 0x1F));
 
     for (size_t i = 0; i < entries.size(); i++) {
+        if (checkAbort(cancelEvent, deadlineTick, hasDeadline, errMsg, outCanceled, outTimedOut)) {
+            out.clear();
+            return out;
+        }
         const ZipEntry& e = entries[i];
         std::string comp;
         deflateStore(e.data, comp);
@@ -472,8 +574,21 @@ struct GroupRow {
 bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
                                 const std::wstring& outXlsxPath,
                                 const std::wstring& appRoot,
-                                std::wstring& errMsg) {
+                                std::wstring& errMsg,
+                                double customDensity,
+                                HANDLE cancelEvent,
+                                DWORD deadlineTick,
+                                bool hasDeadline,
+                                bool* outCanceled,
+                                bool* outTimedOut) {
     errMsg.clear();
+    if (outCanceled) *outCanceled = false;
+    if (outTimedOut) *outTimedOut = false;
+
+    // 进入即检查一次取消 / 超时（"0" 号检查点）
+    if (checkAbort(cancelEvent, deadlineTick, hasDeadline, errMsg, outCanceled, outTimedOut)) {
+        return false;
+    }
 
     // -----------------------------------------------------------------
     // 1. 读取 group CSV
@@ -513,11 +628,14 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     std::vector<std::wstring> mediaFiles;
 
     for (size_t r = 1; r < table.size(); r++) {
+        if (checkAbort(cancelEvent, deadlineTick, hasDeadline, errMsg, outCanceled, outTimedOut)) {
+            return false;
+        }
         const Row& row = table[r];
         if (row.size() <= 1) continue;
 
         std::string status = cellOf(row, ixStatus);
-        if (status != "ok" && status != "area_warning") {
+        if (!isKnownStatus(status)) {
             errMsg = L"分组测量数据状态异常 (status=" + wide(status) + L")。";
             return false;
         }
@@ -587,12 +705,53 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
 
     std::map<std::string, double> densityTable;
     parseMaterials(materialsXml, densityTable);
-    const int matLastRow = 20;
-    const std::string defaultMaterial = "PP-TD20";
+
+    // ---------------------------------------------------------------
+    // 2b. 自定义密度传播：命令行 / 外部指定的密度作为第 21 行材料写入
+    // ---------------------------------------------------------------
+    int matLastRow = 20;                                  // <x:sheetData> 有效材料末行
+    std::string activeMaterial = "PP-TD20";               // 列 F 使用的材料牌号
     double defaultDensity = 1010.0;
     {
-        std::map<std::string, double>::const_iterator it = densityTable.find(defaultMaterial);
+        std::map<std::string, double>::const_iterator it = densityTable.find(activeMaterial);
         if (it != densityTable.end()) defaultDensity = it->second;
+    }
+    double activeDensity = defaultDensity;
+
+    const bool useCustomDensity = (customDensity > 0.0 && _finite(customDensity) != 0);
+    if (useCustomDensity) {
+        matLastRow = 21;
+        activeMaterial = utf8(L"自定义密度");
+        activeDensity = customDensity;
+
+        std::string customRow = "<x:row r=\"21\">";
+        customRow += "<x:c r=\"A21\" s=\"10\" t=\"str\"><x:v>";
+        customRow += esc(activeMaterial);
+        customRow += "</x:v></x:c>";
+        customRow += "<x:c r=\"B21\" s=\"11\" t=\"n\"><x:v>";
+        customRow += fmt(customDensity, 6);
+        customRow += "</x:v></x:c>";
+        customRow += "<x:c r=\"C21\" s=\"12\" t=\"str\"><x:v>";
+        customRow += esc(utf8(L"自定义材料"));
+        customRow += "</x:v></x:c>";
+        customRow += "<x:c r=\"D21\" s=\"12\" t=\"str\"><x:v>";
+        customRow += esc(utf8(L"命令行/外部指定密度"));
+        customRow += "</x:v></x:c>";
+        customRow += "</x:row>";
+
+        // 保持 sheetData 内行号升序：模板在第 21 行留空、备注位于第 22 行，
+        // 因此优先插入到 r="22" 之前，找不到时退化为 </x:sheetData> 之前。
+        size_t sheetDataEnd = materialsXml.find("</x:sheetData>");
+        size_t noteRowPos = materialsXml.find("<x:row r=\"22\"");
+        if (noteRowPos != std::string::npos &&
+            (sheetDataEnd == std::string::npos || noteRowPos < sheetDataEnd)) {
+            materialsXml.insert(noteRowPos, customRow);
+        } else if (sheetDataEnd != std::string::npos) {
+            materialsXml.insert(sheetDataEnd, customRow);
+        } else {
+            errMsg = L"材料密度模板结构异常，无法写入自定义密度行。";
+            return false;
+        }
     }
 
     // -----------------------------------------------------------------
@@ -685,6 +844,10 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     double sumMx = 0.0, sumMy = 0.0, sumMz = 0.0;
 
     for (size_t i = 0; i < n; i++) {
+        // 逐行检查取消 / 超时，保证大模型下也能立即响应
+        if (checkAbort(cancelEvent, deadlineTick, hasDeadline, errMsg, outCanceled, outTimedOut)) {
+            return false;
+        }
         const GroupRow& g = groups[i];
         int r = firstRow + (int)i;
         char rowOpen[64];
@@ -709,20 +872,16 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
         cellNum(s1, ref, 28, fmt(g.totalVolume, 4));
 
         cellRef(ref, sizeof(ref), 5, r);
-        cellText(s1, ref, 10, defaultMaterial);
-
-        double density = defaultDensity;
-        std::map<std::string, double>::const_iterator it = densityTable.find(defaultMaterial);
-        if (it != densityTable.end()) density = it->second;
+        cellText(s1, ref, 10, activeMaterial);
 
         // 公式内含中文，需先转成 UTF-8
         std::string vlookup = utf8(L"VLOOKUP(F") + fmtInt(r) +
                               utf8(L",'材料密度'!$A$2:$B$") + fmtInt(matLastRow) +
                               utf8(L",2,FALSE)");
         cellRef(ref, sizeof(ref), 6, r);
-        cellFormula(s1, ref, 27, vlookup, fmt(density, 4), true);
+        cellFormula(s1, ref, 27, vlookup, fmt(activeDensity, 4), true);
 
-        double weight = g.totalVolume * density / 1000000.0;
+        double weight = g.totalVolume * activeDensity / 1000000.0;
         std::string weightFormula = std::string("E") + fmtInt(r) + "*G" + fmtInt(r) + "/1000000";
         cellRef(ref, sizeof(ref), 7, r);
         cellFormula(s1, ref, 29, weightFormula, fmt(weight, 12), true);
@@ -897,6 +1056,9 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
 
         int picId = 0;
         for (size_t i = 0; i < n; i++) {
+            if (checkAbort(cancelEvent, deadlineTick, hasDeadline, errMsg, outCanceled, outTimedOut)) {
+                return false;
+            }
             const GroupRow& g = groups[i];
             if (g.mediaIndex <= 0) continue;
             int excelRow = firstRow + (int)i;
@@ -938,6 +1100,10 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     // -----------------------------------------------------------------
     std::string sheet3Xml;
     bool hasSheet3 = false;
+    // 异常与警告明细 (empty_body / area_warning / render_warning / inertia_warning ...)
+    std::string anomalySheetXml;
+    bool hasAnomalySheet = false;
+    int anomalySheetNum = 0;
     {
         // baseOf(csv) = "Entity_Analysis_<id>.csv"  →  "Instances_<id>.csv"
         std::wstring csvBase = baseOf(csvPath);
@@ -966,9 +1132,19 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
                 if (iIndex >= 0 && iName >= 0 && iFeat >= 0 && iTag >= 0 &&
                     iVol >= 0 && iCx >= 0 && iCy >= 0 && iCz >= 0 && iStat >= 0) {
                     std::vector<Row> tiny;
+                    std::vector<Row> anomalies;
                     for (size_t r = 1; r < ins.size(); r++) {
+                        if (checkAbort(cancelEvent, deadlineTick, hasDeadline,
+                                       errMsg, outCanceled, outTimedOut)) {
+                            return false;
+                        }
                         if (ins[r].size() <= 1) continue;
-                        if (cellOf(ins[r], iStat) == "tiny_volume") tiny.push_back(ins[r]);
+                        std::string st = cellOf(ins[r], iStat);
+                        if (st == "tiny_volume") {
+                            tiny.push_back(ins[r]);
+                        } else if (!st.empty() && st != "ok") {
+                            anomalies.push_back(ins[r]);
+                        }
                     }
 
                     if (!tiny.empty()) {
@@ -1064,6 +1240,84 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
                         sheet3Xml += "<x:pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\" />";
                         sheet3Xml += "</x:worksheet>";
                     }
+
+                    // ---- 异常与警告明细 (empty_body / *_warning) ----
+                    if (!anomalies.empty()) {
+                        hasAnomalySheet = true;
+                        anomalySheetNum = hasSheet3 ? 4 : 3;
+
+                        const wchar_t* anomalyHeader[6] = {
+                            L"实例序号", L"实体名称", L"特征名称", L"体标签",
+                            L"异常状态", L"说明"
+                        };
+                        const int anomalyW[6] = { 13, 30, 22, 14, 26, 72 };
+
+                        anomalySheetXml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+                        anomalySheetXml += "<x:worksheet xmlns:x=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">";
+                        anomalySheetXml += "<x:sheetViews><x:sheetView showGridLines=\"0\" workbookViewId=\"0\">";
+                        anomalySheetXml += "<x:pane ySplit=\"1\" topLeftCell=\"A2\" activePane=\"bottomLeft\" state=\"frozen\" />";
+                        anomalySheetXml += "</x:sheetView></x:sheetViews>";
+                        anomalySheetXml += "<x:sheetFormatPr defaultRowHeight=\"15\" />";
+                        anomalySheetXml += "<x:cols>";
+                        for (int c = 0; c < 6; c++) {
+                            char b[160];
+                            sprintf_s(b, sizeof(b),
+                                     "<x:col min=\"%d\" max=\"%d\" width=\"%d\" hidden=\"0\" customWidth=\"1\" />",
+                                     c + 1, c + 1, anomalyW[c]);
+                            anomalySheetXml += b;
+                        }
+                        anomalySheetXml += "</x:cols>";
+                        anomalySheetXml += "<x:sheetData>";
+
+                        anomalySheetXml += "<x:row r=\"1\" ht=\"32\" customHeight=\"1\">";
+                        char aref[16];
+                        for (int c = 0; c < 6; c++) {
+                            cellRef(aref, sizeof(aref), c, 1);
+                            cellText(anomalySheetXml, aref, 47, utf8(anomalyHeader[c]));
+                        }
+                        anomalySheetXml += "</x:row>";
+
+                        for (size_t k = 0; k < anomalies.size(); k++) {
+                            if (checkAbort(cancelEvent, deadlineTick, hasDeadline,
+                                           errMsg, outCanceled, outTimedOut)) {
+                                return false;
+                            }
+                            const Row& row = anomalies[k];
+                            int r = (int)k + 2;
+                            char rowOpen[64];
+                            sprintf_s(rowOpen, sizeof(rowOpen), "<x:row r=\"%d\">", r);
+                            anomalySheetXml += rowOpen;
+
+                            double idxVal = 0.0, tagVal = 0.0;
+                            bool okIdx = toNumber(cellOf(row, iIndex), idxVal);
+                            bool okTag = toNumber(cellOf(row, iTag), tagVal);
+
+                            cellRef(aref, sizeof(aref), 0, r);
+                            if (okIdx) cellNum(anomalySheetXml, aref, 48, fmt(idxVal, 0));
+                            else cellEmpty(anomalySheetXml, aref, 48);
+
+                            cellRef(aref, sizeof(aref), 1, r);
+                            cellText(anomalySheetXml, aref, 48, cellOf(row, iName));
+                            cellRef(aref, sizeof(aref), 2, r);
+                            cellText(anomalySheetXml, aref, 48, cellOf(row, iFeat));
+
+                            cellRef(aref, sizeof(aref), 3, r);
+                            if (okTag) cellNum(anomalySheetXml, aref, 48, fmt(tagVal, 0));
+                            else cellEmpty(anomalySheetXml, aref, 48);
+
+                            std::string st = cellOf(row, iStat);
+                            cellRef(aref, sizeof(aref), 4, r);
+                            cellText(anomalySheetXml, aref, 48, statusLabel(st));
+                            cellRef(aref, sizeof(aref), 5, r);
+                            cellText(anomalySheetXml, aref, 48, statusNote(st));
+
+                            anomalySheetXml += "</x:row>";
+                        }
+
+                        anomalySheetXml += "</x:sheetData>";
+                        anomalySheetXml += "<x:pageMargins left=\"0.7\" right=\"0.7\" top=\"0.75\" bottom=\"0.75\" header=\"0.3\" footer=\"0.3\" />";
+                        anomalySheetXml += "</x:worksheet>";
+                    }
                 }
             }
         }
@@ -1085,6 +1339,13 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     contentTypes += "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\" />";
     if (hasSheet3) {
         contentTypes += "<Override PartName=\"/xl/worksheets/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\" />";
+    }
+    if (hasAnomalySheet) {
+        char b[256];
+        sprintf_s(b, sizeof(b),
+                 "<Override PartName=\"/xl/worksheets/sheet%d.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\" />",
+                 anomalySheetNum);
+        contentTypes += b;
     }
     if (!mediaFiles.empty()) {
         contentTypes += "<Override PartName=\"/xl/drawings/drawing1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\" />";
@@ -1111,6 +1372,14 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
         workbook += esc(utf8(L"微小几何体筛除记录"));
         workbook += "\" sheetId=\"3\" r:id=\"rId6\" />";
     }
+    if (hasAnomalySheet) {
+        char b[256];
+        sprintf_s(b, sizeof(b), "\" sheetId=\"%d\" r:id=\"%s\" />",
+                 anomalySheetNum, hasSheet3 ? "rId7" : "rId6");
+        workbook += "<x:sheet name=\"";
+        workbook += esc(utf8(L"异常与警告明细"));
+        workbook += b;
+    }
     workbook += "</x:sheets></x:workbook>";
 
     std::string workbookRels = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
@@ -1122,6 +1391,13 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     workbookRels += "<Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/sheet2.xml\" Id=\"rId5\" />";
     if (hasSheet3) {
         workbookRels += "<Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/sheet3.xml\" Id=\"rId6\" />";
+    }
+    if (hasAnomalySheet) {
+        char b[320];
+        sprintf_s(b, sizeof(b),
+                 "<Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/sheet%d.xml\" Id=\"%s\" />",
+                 anomalySheetNum, hasSheet3 ? "rId7" : "rId6");
+        workbookRels += b;
     }
     workbookRels += "</Relationships>";
 
@@ -1149,10 +1425,19 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
     if (hasSheet3) {
         e.name = "xl/worksheets/sheet3.xml"; e.data = sheet3Xml; entries.push_back(e);
     }
+    if (hasAnomalySheet) {
+        e.name = "xl/worksheets/sheet" + fmtInt((long long)anomalySheetNum) + ".xml";
+        e.data = anomalySheetXml;
+        entries.push_back(e);
+    }
     if (!mediaFiles.empty()) {
         e.name = "xl/drawings/drawing1.xml"; e.data = drawingXml; entries.push_back(e);
         e.name = "xl/drawings/_rels/drawing1.xml.rels"; e.data = drawingRels; entries.push_back(e);
         for (size_t i = 0; i < mediaFiles.size(); i++) {
+            if (checkAbort(cancelEvent, deadlineTick, hasDeadline,
+                           errMsg, outCanceled, outTimedOut)) {
+                return false;
+            }
             std::string png;
             if (!readAll(mediaFiles[i], png) || png.empty()) {
                 errMsg = L"无法读取实体预览图：" + baseOf(mediaFiles[i]);
@@ -1164,9 +1449,10 @@ bool BuildFilteredBomXlsxNative(const std::wstring& csvPath,
         }
     }
 
-    std::string zip = buildZip(entries);
+    std::string zip = buildZip(entries, cancelEvent, deadlineTick, hasDeadline,
+                               errMsg, outCanceled, outTimedOut);
     if (zip.empty()) {
-        errMsg = L"生成 OpenXML 压缩包失败。";
+        if (errMsg.empty()) errMsg = L"生成 OpenXML 压缩包失败。";
         return false;
     }
     if (!writeAll(outXlsxPath, zip)) {

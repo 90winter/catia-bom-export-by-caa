@@ -18,7 +18,15 @@ namespace {
 const UINT MSG = WM_APP + 1;
 
 const DWORD WORKER_HEARTBEAT_TIMEOUT_MS = 180000;
-const DWORD WORKER_TOTAL_TIMEOUT_MS = 600000;
+
+// Total time budget of the CAA worker chain (30 minutes).  Kept in sync with
+// TASK_TOTAL_TIMEOUT_MS below so a single constant documents the whole chain.
+const DWORD WORKER_TOTAL_TIMEOUT_MS = 1800000;
+
+// Total time budget of the whole job (CAA worker + Node/native Excel writer +
+// copy to the destination folder): 30 minutes.
+const DWORD TASK_TOTAL_TIMEOUT_MS = 1800000;
+
 const DWORD NODE_TIMEOUT_MS = 120000;
 
 static void send(HWND h, WPARAM stage, LPARAM value = 0) {
@@ -325,6 +333,23 @@ static bool finalMarker(const std::string& s) {
     return line == "failures=0";
 }
 
+// Status values the CAA worker may emit for one grouped entity row.
+//   ok                          : measurement + preview fully succeeded
+//   area_warning                : surface area could not be measured
+//   render_warning              : preview picture fell back to a blank image
+//   inertia_warning             : principal moments of inertia unavailable
+// plus every combination of the three warnings (sorted alphabetically).
+static bool isValidGroupStatus(const std::string& st) {
+    return st == "ok" ||
+           st == "area_warning" ||
+           st == "render_warning" ||
+           st == "inertia_warning" ||
+           st == "area_render_warning" ||
+           st == "area_inertia_warning" ||
+           st == "render_inertia_warning" ||
+           st == "area_render_inertia_warning";
+}
+
 static bool validateRows(const std::vector<std::vector<std::string> >& rows, int expected, const std::wstring& dir) {
     if (expected < 0 || rows.size() != (size_t)expected + 1) return false;
     const std::vector<std::string>& h = rows[0];
@@ -336,7 +361,7 @@ static bool validateRows(const std::vector<std::vector<std::string> >& rows, int
     if (image < 0 || status < 0) return false;
     for (size_t i = 1; i < rows.size(); i++) {
         if (rows[i].size() <= (size_t)std::max(image, status) ||
-            (rows[i][status] != "ok" && rows[i][status] != "area_warning")) {
+            !isValidGroupStatus(rows[i][status])) {
             return false;
         }
         std::wstring name = utf8w(rows[i][image]);
@@ -435,7 +460,18 @@ static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::ve
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
             ZeroMemory(&jeli, sizeof(jeli));
             jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
-            SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+            if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+                // The process tree watchdog is unusable: fall back to plain
+                // TerminateProcess() handling instead of silently "succeeding".
+                DWORD jobErr = GetLastError();
+                CloseHandle(hJob);
+                hJob = NULL;
+                char jbuf[160];
+                sprintf_s(jbuf, sizeof(jbuf),
+                          "[launch] job_object=disabled SetInformationJobObject_err=%lu\r\n",
+                          (unsigned long)jobErr);
+                writeLogHandle(file, std::string(jbuf));
+            }
         }
     }
 
@@ -480,8 +516,49 @@ static bool launch(const std::wstring& cmd, const std::wstring& logfile, std::ve
         }
     } else {
         if (hJob != NULL) {
-            AssignProcessToJobObject(hJob, pi.hProcess);
-            ResumeThread(pi.hThread);
+            if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+                // Child is still suspended: kill it, otherwise a failed bind
+                // would leave an unreachable zombie process behind.
+                DWORD bindErr = GetLastError();
+                char bbuf[160];
+                sprintf_s(bbuf, sizeof(bbuf),
+                          "[launch_failed] AssignProcessToJobObject GetLastError=%lu\r\n",
+                          (unsigned long)bindErr);
+                writeLogHandle(file, std::string(bbuf));
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 3000);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                pi.hThread = NULL;
+                pi.hProcess = NULL;
+                CloseHandle(hJob);
+                hJob = NULL;
+                CloseHandle(input);
+                CloseHandle(file);
+                return false;
+            }
+            if (ResumeThread(pi.hThread) == (DWORD)-1) {
+                // The suspended child could not be resumed: tear everything down.
+                DWORD resumeErr = GetLastError();
+                char rbuf[160];
+                sprintf_s(rbuf, sizeof(rbuf),
+                          "[launch_failed] ResumeThread GetLastError=%lu\r\n",
+                          (unsigned long)resumeErr);
+                writeLogHandle(file, std::string(rbuf));
+                TerminateJobObject(hJob, 1);
+                TerminateProcess(pi.hProcess, 1);
+                WaitForSingleObject(pi.hProcess, 3000);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                pi.hThread = NULL;
+                pi.hProcess = NULL;
+                CloseHandle(hJob);
+                hJob = NULL;
+                CloseHandle(input);
+                CloseHandle(file);
+                return false;
+            }
+            writeLogHandle(file, "[launch] job_object=bound\r\n");
             *outJob = hJob;
         }
     }
@@ -636,6 +713,10 @@ unsigned __stdcall RunBomJob(void* raw) {
     BomJob j = *job;
     delete job;
 
+    // Global (whole chain) budget: CAA worker + Excel writer + file copy.
+    DWORD taskStartTick = GetTickCount();
+    DWORD taskDeadlineTick = taskStartTick + TASK_TOTAL_TIMEOUT_MS;
+
     send(j.notify, 0);
 
     std::wstring appRoot = getAppRoot();
@@ -782,6 +863,9 @@ unsigned __stdcall RunBomJob(void* raw) {
     size_t lastLogSize = 0;
     int prev = -1, total = -1;
     std::wstring logfile, csvfile;
+    // Last observed worker heartbeat payload + parsed stage/detail (for the
+    // diagnostic message shown when the watchdog fires).
+    std::string lastHbContent, lastHbStage, lastHbDetail;
 
     for (;;) {
         // 1. Check user cancellation
@@ -800,17 +884,76 @@ unsigned __stdcall RunBomJob(void* raw) {
             return 1;
         }
 
-        // 2. Check timeouts
+        // 2. Check timeouts (global task budget + worker heartbeat liveness)
         DWORD now = GetTickCount();
-        if ((now - startTick > WORKER_TOTAL_TIMEOUT_MS) ||
+        if ((now - taskStartTick > TASK_TOTAL_TIMEOUT_MS) ||
             (now - lastActiveTick > WORKER_HEARTBEAT_TIMEOUT_MS)) {
+            bool isTotal = (now - taskStartTick > TASK_TOTAL_TIMEOUT_MS);
+            unsigned long elapsedSec = (unsigned long)((now - taskStartTick) / 1000);
             terminateChildJob(workerJob, pi);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
-            appendLog(workerLog, L"[timeout] worker exceeded timeout limit");
+
+            wchar_t secBuf[32];
+            swprintf_s(secBuf, L"%lu", elapsedSec);
+            std::wstring detailLine = L"[timeout] reason=";
+            detailLine += isTotal ? L"total" : L"heartbeat";
+            detailLine += L" elapsed_s=";
+            detailLine += secBuf;
+            detailLine += L" lastStage=";
+            detailLine += utf8w(lastHbStage);
+            detailLine += L" lastDetail=";
+            detailLine += utf8w(lastHbDetail);
+            appendLog(workerLog, detailLine);
+
             if (j.outExitCode) *j.outExitCode = 1;
-            finish(j.notify, 4, L"CAA 测量分析超时中止；中间日志保留于：" + stage);
+            std::wstring msg = L"CAA 测量分析超时中止（原因：";
+            msg += isTotal ? L"任务总耗时超过 30 分钟上限" : L"测量进程心跳超时，疑似卡死";
+            msg += L"；已耗时 ";
+            msg += secBuf;
+            msg += L" 秒；最后阶段：";
+            msg += utf8w(lastHbStage);
+            msg += L"；细节：";
+            msg += utf8w(lastHbDetail);
+            msg += L"）；中间日志保留于：";
+            msg += stage;
+            finish(j.notify, 4, msg);
             return 1;
+        }
+
+        // 3. Watch the worker heartbeat file (heartbeat_<wid>.txt).  Any change
+        //    of its content proves the worker thread is still alive even while
+        //    a single geometry operation takes minutes.
+        std::wstring hbName = findOne(stage, L"heartbeat_*.txt");
+        if (!hbName.empty()) {
+            std::string hbContent = readFile(stage + L"\\" + hbName);
+            if (!hbContent.empty() && hbContent != lastHbContent) {
+                lastHbContent = hbContent;
+                lastActiveTick = GetTickCount();
+
+                size_t sp = hbContent.find("stage=");
+                if (sp != std::string::npos) {
+                    size_t se = hbContent.find('\n', sp);
+                    std::string v = hbContent.substr(sp + 6,
+                        (se == std::string::npos ? hbContent.size() : se) - (sp + 6));
+                    while (!v.empty() && (v[v.size() - 1] == '\r' || v[v.size() - 1] == ' ' ||
+                                          v[v.size() - 1] == '\t')) {
+                        v.erase(v.size() - 1);
+                    }
+                    lastHbStage = v;
+                }
+                size_t dp = hbContent.find("detail=");
+                if (dp != std::string::npos) {
+                    size_t de = hbContent.find('\n', dp);
+                    std::string v = hbContent.substr(dp + 7,
+                        (de == std::string::npos ? hbContent.size() : de) - (dp + 7));
+                    while (!v.empty() && (v[v.size() - 1] == '\r' || v[v.size() - 1] == ' ' ||
+                                          v[v.size() - 1] == '\t')) {
+                        v.erase(v.size() - 1);
+                    }
+                    lastHbDetail = v;
+                }
+            }
         }
 
         DWORD w = WaitForSingleObject(pi.hProcess, 250);
@@ -912,6 +1055,12 @@ unsigned __stdcall RunBomJob(void* raw) {
     if (hasNodeEngine) {
         std::wstring nodeCmd = quote(nodePath) + L" " + quote(scriptPath) + L" " +
                                quote(csvfile) + L" " + quote(stagedXlsx);
+        // 3rd positional argument of build_filtered_bom.mjs = custom density
+        if (j.density > 0.0 && _finite(j.density)) {
+            wchar_t nodeDens[64];
+            swprintf_s(nodeDens, L" %.15g", j.density);
+            nodeCmd += nodeDens;
+        }
         PROCESS_INFORMATION node;
         ZeroMemory(&node, sizeof(node));
         HANDLE nodeJob = NULL;
@@ -980,9 +1129,38 @@ unsigned __stdcall RunBomJob(void* raw) {
     }
 
     if (!built) {
+        // -- V04: 进入原生 Excel 生成阶段前的取消 / 总超时检查 -------------
+        if (j.cancelEvent && WaitForSingleObject(j.cancelEvent, 0) == WAIT_OBJECT_0) {
+            cleanStage(stage, temp);
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 5, L"任务已由用户取消。");
+            return 1;
+        }
+
+        if ((long)(GetTickCount() - taskDeadlineTick) >= 0) {
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 4, L"任务执行总时间超过 30 分钟限制（Excel 生成阶段）；临时日志保留于：" + stage);
+            return 1;
+        }
+
         DeleteFileW(stagedXlsx.c_str());
         std::wstring nativeErr;
-        bool nativeOk = BuildFilteredBomXlsxNative(csvfile, stagedXlsx, appRoot, nativeErr);
+        bool nativeCanceled = false;
+        bool nativeTimedOut = false;
+        bool nativeOk = BuildFilteredBomXlsxNative(csvfile, stagedXlsx, appRoot, nativeErr,
+                                                  j.density, j.cancelEvent, taskDeadlineTick,
+                                                  true, &nativeCanceled, &nativeTimedOut);
+        if (nativeCanceled) {
+            cleanStage(stage, temp);
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 5, L"任务已由用户取消。");
+            return 1;
+        }
+        if (nativeTimedOut) {
+            if (j.outExitCode) *j.outExitCode = 1;
+            finish(j.notify, 4, L"Excel 生成超过总任务超时限制；详细日志保留于：" + stage);
+            return 1;
+        }
         if (nativeOk && regular(stagedXlsx) && validXlsx(stagedXlsx)) {
             built = true;
             engine = L"NativeC++";
@@ -1006,6 +1184,14 @@ unsigned __stdcall RunBomJob(void* raw) {
     size_t dot = stem.find_last_of(L'.');
     if (dot != std::wstring::npos) stem.erase(dot);
     if (stem.empty()) stem = L"BOM";
+
+    // -- V04: 拷贝到目标目录前的取消检查 ---------------------------------
+    if (j.cancelEvent && WaitForSingleObject(j.cancelEvent, 0) == WAIT_OBJECT_0) {
+        cleanStage(stage, temp);
+        if (j.outExitCode) *j.outExitCode = 1;
+        finish(j.notify, 5, L"任务已由用户取消。");
+        return 1;
+    }
 
     std::wstring target;
     for (unsigned n = 1; n < 10000; n++) {
@@ -1031,9 +1217,45 @@ unsigned __stdcall RunBomJob(void* raw) {
     bool hasWarnings = (finalLog.find("warnings=0") == std::string::npos);
     bool noNormal = (groupCount(finalLog) == 0);
 
-    std::wstring warning = noNormal
-        ? L"\n\n注意：模型中实体均为微小体并已被筛除，请查看《微小几何体筛除记录》工作表。"
-        : (hasWarnings ? L"\n\n注意：模型中存在体积小于 1.0 mm³ 的微小实体，已自动筛除并记录于《微小几何体筛除记录》工作表中。" : L"");
+    // -- V04: 解析 CAA worker 输出的 warning_breakdown 分类计数 -----------
+    int wbTiny = 0;
+    int wbEmpty = 0;
+    int wbArea = 0;
+    int wbRender = 0;
+    int wbInertia = 0;
+    {
+        size_t wbPos = finalLog.find("warning_breakdown ");
+        if (wbPos != std::string::npos) {
+            const char* wbText = finalLog.c_str() + wbPos;
+            sscanf_s(wbText,
+                     "warning_breakdown tiny=%d empty_body=%d area_warning=%d render_fallback=%d inertia_fallback=%d",
+                     &wbTiny, &wbEmpty, &wbArea, &wbRender, &wbInertia);
+        }
+    }
+
+    std::wstring warning;
+    if (noNormal) {
+        warning = L"\n\n注意：模型中实体均为微小体或空实体并已被筛除，请查看《微小几何体筛除记录》或《异常与警告明细》工作表。";
+    } else {
+        if (wbTiny > 0) {
+            warning += L"\n\n注意：模型中存在微小实体（体积小于 1.0 mm³），已自动筛除并记录于《微小几何体筛除记录》工作表中。";
+        }
+        if (wbEmpty > 0) {
+            warning += L"\n\n注意：模型中存在空实体（empty_body），已记录于《异常与警告明细》工作表中。";
+        }
+        if (wbArea > 0) {
+            warning += L"\n\n警告：部分实体表面积计算异常（area_warning），已记录于《异常与警告明细》工作表中。";
+        }
+        if (wbRender > 0) {
+            warning += L"\n\n警告：部分实体渲染截图回退占位图（render_warning），请检查《异常与警告明细》工作表。";
+        }
+        if (wbInertia > 0) {
+            warning += L"\n\n警告：部分实体惯性矩阵测量失败并已按单件分组（inertia_warning），请检查《异常与警告明细》工作表。";
+        }
+        if (warning.empty() && hasWarnings) {
+            warning = L"\n\n注意：分析过程存在警告，请查看《微小几何体筛除记录》或《异常与警告明细》工作表。";
+        }
+    }
 
     if (!cleanStage(stage, temp)) {
         warning += L"\n\n注意：临时缓存未能完全清理（不影响已生成的 Excel）。如需手动清理，位置：";
